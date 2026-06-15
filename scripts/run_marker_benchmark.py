@@ -33,20 +33,6 @@ from tqdm import tqdm
 
 # IMPORT EXTRACTORS
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-from benchmark.extractors.grobid.grobid_run import extract_raw as extract_raw_grobid, extraction_if_needed as extraction_grobid_if_needed
-from benchmark.extractors.refextract.refextract_run import extract_raw as extract_raw_refextract
-from benchmark.extractors.pymupdf.pymupdf_run import extract_raw as extract_raw_pymupdf
-from benchmark.extractors.tabula.tabula_run import extract_raw as extract_raw_tabula
-from benchmark.extractors.camelot.camelot_run import extract_raw as extract_raw_camelot
-from benchmark.extractors.scienceparse.scienceparse_run import extract_raw as extract_raw_scienceparse, extraction_if_needed as extraction_if_needed_scienceparse
-from benchmark.extractors.pdfact.pdfact_run import extract_raw as extract_raw_pdfact, run_pdfact_if_needed
-from benchmark.extractors.cermine.cermine_run import extract_raw as extract_raw_cermine, run_cermine_if_needed
-from benchmark.extractors.sciencebeam.sciencebeam_run import extract_raw as extract_raw_sciencebeam, extract_sciencebeam_if_needed
-from benchmark.extractors.unstructured.unstructured_run import extract_raw as extract_raw_unstructured, extraction_if_needed as extraction_if_needed_unstructured
-from benchmark.extractors.pdfplumber.pdfplumber_run import extract_pdfplumber as extract_raw_pdfplumber
-
-from benchmark.extractors.nougat.nougat_run import extract_raw as extract_raw_nougat, extraction_if_needed as extraction_if_needed_nougat
-from benchmark.extractors.docling.docling_run import extract_raw as extract_raw_docling, extraction_if_needed as extraction_if_needed_docling
 from benchmark.extractors.marker.marker_run import extract_raw as extract_raw_marker
 
 # IMPORT DATASET UTILS
@@ -57,24 +43,18 @@ from benchmark.evaluation.align import align
 
 # REMOVE WARNINGS FROM PYPDF'S CRYPTOGRAPHY DEPRICATION
 import warnings
-from cryptography.utils import CryptographyDeprecationWarning
-warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
+
+try:
+    from cryptography.utils import CryptographyDeprecationWarning
+    warnings.filterwarnings(
+        "ignore",
+        category=CryptographyDeprecationWarning
+    )
+except ImportError:
+    pass
 
 
 extractor_map:dict[str, callable] = {
-    "camelot": extract_raw_camelot,
-    "cermine": extract_raw_cermine,
-    "docling": extract_raw_docling,
-    "grobid": extract_raw_grobid,
-    "nougat": extract_raw_nougat,
-    "pdfact": extract_raw_pdfact,
-    "pdfplumber": extract_raw_pdfplumber,
-    "pymupdf": extract_raw_pymupdf,
-    "refextract": extract_raw_refextract,
-    "sciencebeam": extract_raw_sciencebeam,
-    "scienceparse": extract_raw_scienceparse,
-    "tabula": extract_raw_tabula,
-    "unstructured": extract_raw_unstructured,
     "marker": extract_raw_marker,
 }
 """
