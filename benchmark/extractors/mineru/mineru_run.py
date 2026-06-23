@@ -161,6 +161,7 @@ def extract_raw(base_dir: str, label: str, pdf) -> Tuple[bool, List]:
     
     front_blocks = []
 
+    
     if data.get("pdf_info"):
         first_page = data["pdf_info"][0]
 
@@ -262,127 +263,131 @@ def extract_raw(base_dir: str, label: str, pdf) -> Tuple[bool, List]:
                         outputs.append(
                             (pdf.pdf_name, page_num, "table", txt)
                         )
-            # =====================================================
-            # AUTHOR / AFFILIATION / EMAIL / SECTION
-            # =====================================================
+    # =====================================================
+    # AUTHOR / AFFILIATION / EMAIL / SECTION
+    # =====================================================
 
-            if label == "email":
+    if label == "email":
 
-                for _, txt in front_blocks:
+        for _, txt in front_blocks:
 
-                    for em in EMAIL_RE.findall(txt):
+            for em in EMAIL_RE.findall(txt):
 
-                        outputs.append(
-                            (pdf.pdf_name, 1, "email", em)
-                    )
+                outputs.append(
+                    (pdf.pdf_name, 1, "email", em)
+                )
 
-            elif label == "affiliation":
+    elif label == "affiliation":
 
-                for _, txt in front_blocks:
+        for _, txt in front_blocks:
 
-                    if AFFILIATION_RE.search(txt):
+            if AFFILIATION_RE.search(txt):
 
-                        outputs.append(
-                            (pdf.pdf_name, 1, "affiliation", txt)
-                    )
+                outputs.append(
+                    (pdf.pdf_name, 1, "affiliation", txt)
+                )
 
-            elif label == "author":
+    elif label == "author":
 
-                for btype, txt in front_blocks[:5]:
+        for btype, txt in front_blocks[:5]:
 
-                    if btype not in ["text", "list"]:
-                        continue
+            if btype not in ["text", "list"]:
+                continue
 
-                    txt = re.sub(
-                        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
-                        " ",
-                        txt
-                    )
+            txt = re.sub(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                " ",
+                txt
+            )
 
-                    if AFFILIATION_RE.search(txt):
-                        continue
+            if AFFILIATION_RE.search(txt):
+                continue
 
-                    txt = re.sub(r"<sup>.*?</sup>", " ", txt)
+            txt = re.sub(r"<sup>.*?</sup>", " ", txt)
 
-                    parts = re.split(
-                        r",|;|\band\b|\&",
-                        txt
-                    )
+            parts = re.split(
+                r",|;|\band\b|\&",
+                txt
+            )
 
-                    for p in parts:
+            for p in parts:
 
-                        p = p.strip()
+                p = p.strip()
  
-                        if looks_like_author_name(p):
+                if looks_like_author_name(p):
 
-                            outputs.append(
-                                (pdf.pdf_name, 1, "author", p)
-                            )
+                    outputs.append(
+                        (pdf.pdf_name, 1, "author", p)
+                    )
  
-            elif label == "section":
+    elif label == "section":
 
-                first_title = True
+        first_title = True
 
-                for page in data.get("pdf_info", []):
+        for page in data.get("pdf_info", []):
 
-                    page_num = page.get("page_idx", 0) + 1
+            page_num = page.get("page_idx", 0) + 1
 
-                    for block in page.get("para_blocks", []):
+            for block in page.get("para_blocks", []):
 
-                        if block.get("type") != "title":
-                            continue
+                if block.get("type") != "title":
+                    continue
 
-                        txt = get_text(block)
+                txt = get_text(block)
 
-                        if not txt:
-                            continue
+                if not txt:
+                    continue
 
-                        if first_title:
-                            first_title = False
-                            continue
+                if first_title:
+                    first_title = False
+                    continue
 
-                        outputs.append(
-                            (pdf.pdf_name, page_num, "section", txt)
-                        )
+                outputs.append(
+                    (pdf.pdf_name, page_num, "section", txt)
+                )
 
-            
-            elif label == "keyword":
 
-                for _, txt in front_blocks:
 
-                    low = txt.lower()
+    elif label == "keyword":
 
-                    if "keyword" not in low:
-                        continue
+        for _, txt in front_blocks:
 
-                    txt = re.sub(
-                        r"(?i).*keywords?\s*[:.]?\s*",
-                        "",
-                        txt
-                    )
+            low = txt.lower()
 
-                    txt = re.sub(
-                        r"<sup>.*?</sup>",
-                        " ",
-                        txt
-                    )
+            if "keyword" not in low:
+                continue
 
-                    parts = re.split(
-                        r"\s*·\s*|\s*;\s*|\s*,\s*",
-                        txt
-                    )
+            txt = re.sub(
+                r"(?i).*keywords?\s*[:.]?\s*",
+                "",
+                txt
+            )
 
-                    for p in parts:
+            txt = re.sub(
+                r"<sup>.*?</sup>",
+                " ",
+                txt
+            )
 
-                        p = p.strip(" .")
+            parts = re.split(
+                r"\s*·\s*|\s*;\s*|\s*,\s*",
+                txt
+            )
 
-                        if len(p) < 2:
-                            continue
+            for p in parts:
+
+                p = p.strip(" .")
+
+                if len(p) < 2:
+                    continue
 
                         
 
-                        outputs.append(
-                            (pdf.pdf_name, 1, "keyword", p)
-                        )
-                        
+                outputs.append(
+                    (pdf.pdf_name, 1, "keyword", p)
+                )
+
+    
+
+
     return True, outputs
