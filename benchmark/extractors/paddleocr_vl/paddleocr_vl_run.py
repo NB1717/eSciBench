@@ -1,4417 +1,2213 @@
+from pylatexenc.latex2text import LatexNodes2Text
 import json
-import re
-import subprocess
-import unicodedata
-from pathlib import Path
-from datetime import datetime
 from benchmark.normalisation import normalize_string
-from bs4 import BeautifulSoup
 
 
-OUTPUT_ROOT = Path(
-    "/scratch/nasimb/escibench_project/paddleocr_vl_workspace/"
-    "paddleocr_vl_outputs"
-)
+def extract_title(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    if page.get("page_index") != 0:
+        return []
+
+    return [
+        normalize_string(block.get("block_content", ""))
+        for block in page.get("parsing_res_list", [])
+        if block.get("block_label") == "doc_title"
+        and block.get("block_content", "").strip()
+    ]
+
+import re
+import unicodedata
 
 
-def _raw_output_root_for_pdf(pdf):
-    pdf_name = Path(pdf.pdf_name).stem
+def extract_email(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
 
-    pdf_dir = OUTPUT_ROOT / pdf_name
+    emails = []
 
-    if pdf_dir.is_dir():
-        return OUTPUT_ROOT
+    # Search every block on every page.
+    for block in page.get("parsing_res_list", []):
+        text = str(block.get("block_content", ""))
 
-    return None
-
-
-def normalize_text(text):
-    if text is None:
-        return ""
-
-    text = str(text)
-    text = unicodedata.normalize("NFKC", text)
-
-    text = re.sub(r"\\text\s*\{([^{}]*)\}", r"\1", text)
-    text = re.sub(r'([A-Za-z0-9])_\{([^{}]+)\}', r'\1_\2', text)
-    text = text.replace(r"\cdots", "⋯")
-
-    text = text.replace("\n", " ")
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip().lower()
-
-
-def load_first_page(pdf):
-    pdf_name = Path(pdf.pdf_name).stem
-    raw_root = _raw_output_root_for_pdf(pdf)
-
-    if raw_root is None:
-        return None
-
-    pdf_dir = raw_root / pdf_name
-    page_file = pdf_dir / f"{pdf_name}_0_res.json"
-
-    if not page_file.is_file():
-        return None
-
-    with open(page_file, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def collect_reference_blocks(pages):
-
-    results = []
-
-    first_ref_page = None
-
-
-    for page in pages:
-
-        if any(
-            b.get("block_label") == "reference_content"
-            for b in page.get("parsing_res_list", [])
-        ):
-            first_ref_page = page["page_index"]
-            break
-
-    if first_ref_page is None:
-        return results
-
-
-    for page in pages:
-
-        page_index = page["page_index"]
-
-        for block in page.get("parsing_res_list", []):
-
-            if block.get("block_label") != "reference_content":
-                continue
-
-            text = normalize_text(block.get("block_content", ""))
-
-            if text:
-                results.append((page_index, text))
-
-
-    for page in pages:
-
-        page_index = page["page_index"]
-
-        if page_index >= first_ref_page:
+        if not text.strip():
             continue
 
-        if first_ref_page - page_index > 8:
-            continue
+        # Official normalization already applies Unicode NFKC.
+        # This also makes matching consistent with benchmark normalization.
+        text = normalize_string(text)
 
-        labels = {
-            b.get("block_label")
-            for b in page.get("parsing_res_list", [])
-        }
+        # Remove invisible Unicode formatting characters that may split
+        # an otherwise valid email address in OCR output.
+        text = re.sub(r"[\u200b-\u200d\u2060\ufeff]", "", text)
 
-        if labels - {"text", "number"}:
-            continue
+        # {name1, name2}@domain.tld
+        braced_pattern = (
+            r"\{([^{}]+)\}\s*@\s*"
+            r"([A-Za-z0-9.-]+\.[A-Za-z]{2,})"
+        )
 
-        for block in page.get("parsing_res_list", []):
+        for names, domain in re.findall(braced_pattern, text):
+            for name in names.split(","):
+                name = name.strip()
+                if name:
+                    emails.append(f"{name}@{domain}")
 
-            if block.get("block_label") != "text":
-                continue
+        # Remove braced-address form before ordinary extraction so that
+        # the same address is not recovered twice.
+        ordinary_text = re.sub(braced_pattern, "", text)
 
-            text = normalize_text(block.get("block_content", ""))
+        # Ordinary email addresses.
+        emails.extend(
+            re.findall(
+                r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                ordinary_text,
+            )
+        )
 
-            if not text:
-                continue
+    return list(dict.fromkeys(emails))
 
-            if re.match(r"^\[\d+\]", text):
-                results.append((page_index, text))
 
-    results.sort(key=lambda x: (x[0], x[1]))
+def extract_affiliation(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
 
-    return results
+    if page.get("page_index") != 0:
+        return []
 
-def extract_title(pdf):
+    cue = re.compile(
+        r"\b(university|college|school|department|institute|institution|"
+        r"laboratory|laboratories|lab|centre|center|faculty|hospital|"
+        r"academy|research|physics|sciences?|group|cnrs|inria|cern|commissariat)\b",
+        re.I,
+    )
 
-    page = load_first_page(pdf)
+    marker = re.compile(
+        r"^\s*\$\s*\^\{([^}]+)\}\s*\$\s*"
+    )
+    any_marker = re.compile(
+        r"\$\s*\^\{([^}]+)\}\s*\$"
+    )
 
-    if not page:
-        return False, []
+    email = re.compile(r"\S*@\S+")
 
+    stop = re.compile(
+        r"^\s*(preprint|submitted|received|accepted|published|"
+        r"corresponding author|e-?mail|email)\b",
+        re.I,
+    )
+
+    member = re.compile(
+        r"\b(?:senior\s+member|member|fellow)\s*,?\s*IEEE\b",
+        re.I,
+    )
+
+    author_names = extract_author(raw_json_path)
     blocks = page.get("parsing_res_list", [])
 
-    doc_titles = [
-        b for b in blocks
-        if b.get("block_label") == "doc_title"
-        and normalize_text(b.get("block_content"))
-    ]
-
-    doc_titles = sorted(
-        doc_titles,
-        key=lambda b: (
-            b.get("block_order") is None,
-            b.get("block_order")
-            if b.get("block_order") is not None
-            else float("inf"),
-        ),
-    )
-
-    if doc_titles:
-        title = normalize_text(doc_titles[0].get("block_content"))
-
-        return True, [
-            (
-                pdf.pdf_name,
-                page.get("page_index", 0),
-                "title",
-                title,
-            )
-        ]
-
-    headers = [
-        b for b in blocks
-        if b.get("block_label") == "header"
-        and normalize_text(b.get("block_content"))
-    ]
-
-    if headers:
-        title = normalize_text(headers[0].get("block_content"))
-
-        return True, [
-            (
-                pdf.pdf_name,
-                page.get("page_index", 0),
-                "title",
-                title,
-            )
-        ]
-
-    ordered_blocks = sorted(
-        blocks,
-        key=lambda b: (
-            b.get("block_order") is None,
-            b.get("block_order")
-            if b.get("block_order") is not None
-            else float("inf"),
-        ),
-    )
-
-    for block in ordered_blocks:
-        text = normalize_text(block.get("block_content"))
-
-        if not text:
-            continue
-
-        return True, [
-            (
-                pdf.pdf_name,
-                page.get("page_index", 0),
-                "title",
-                text,
-            )
-        ]
-
-    return False, []
-
-
-
-EMAIL_RE = re.compile(
-    r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
-)
-
-GROUP_EMAIL_RE = re.compile(
-    r"[\{\[]([^\{\}\[\]]+)[\}\]]@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})"
-)
-
-
-def load_all_pages(pdf):
-    pdf_name = Path(pdf.pdf_name).stem
-    raw_root = _raw_output_root_for_pdf(pdf)
-
-    if raw_root is None:
-        return []
-
-    pdf_dir = raw_root / pdf_name
-
-    if not pdf_dir.is_dir():
-        return []
-
-    page_files = list(pdf_dir.glob(f"{pdf_name}_*_res.json"))
-
-    def page_number(path):
-        name = path.name
-        prefix = f"{pdf_name}_"
-        suffix = "_res.json"
-        return int(name[len(prefix):-len(suffix)])
-
-    page_files.sort(key=page_number)
-
-    pages = []
-
-    for page_file in page_files:
-        with open(page_file, "r", encoding="utf-8") as f:
-            pages.append(json.load(f))
-
-    return pages
-
-
-
-
-CAPTION_MARKER_RE = re.compile(
-    r"(?ix)^\s*"
-    r"(?:figure|fig\.?|tableau|table|sch[ée]ma)"
-    r"\s*\d+[A-Za-z]?"
-    r"\s*[\.:;\-–—]?\s*"
-)
-
-CAPTION_MARKER_ONLY_RE = re.compile(
-    r"(?ix)^\s*"
-    r"(?:figure|fig\.?|tableau|table|sch[ée]ma)"
-    r"\s*\d+[A-Za-z]?"
-    r"\s*[\.:;\-–—]?\s*$"
-)
-
-CAPTION_FR_WORDS = {
-    "de","du","des","la","le","les","un","une","en","et",
-    "dans","sur","pour","par","avec","aux","au","d","l",
-    "évolution","effet","masse","eaux","traitées","fonction",
-    "schéma","courbe"
-}
-
-CAPTION_EN_WORDS = {
-    "the","of","and","in","for","to","with","from","on","by",
-    "according","effect","evolution","water","treated","mass",
-    "diagram","curve","plot","study","results"
-}
-
-
-def caption_language_score(text, lexicon):
-    words = re.findall(r"[A-Za-zÀ-ÿ]+", text.lower())
-    return sum(w in lexicon for w in words)
-
-
-def caption_split_one_line_bilingual(text):
-    if "\n" in text:
-        return [text]
-
-    boundaries = [
-        m.end()
-        for m in re.finditer(r"\.\s+(?=[A-ZÀ-Ý])", text)
-    ]
-
-    best = None
-
-    for pos in boundaries:
-        left = text[:pos].strip()
-        right = text[pos:].strip()
-
-        if len(left.split()) < 4 or len(right.split()) < 4:
-            continue
-
-        fr_left = caption_language_score(
-            left,
-            CAPTION_FR_WORDS,
-        )
-        en_left = caption_language_score(
-            left,
-            CAPTION_EN_WORDS,
-        )
-        fr_right = caption_language_score(
-            right,
-            CAPTION_FR_WORDS,
-        )
-        en_right = caption_language_score(
-            right,
-            CAPTION_EN_WORDS,
-        )
-
-        if (
-            fr_left >= 2
-            and fr_left > en_left
-            and en_right >= 2
-            and en_right > fr_right
-        ):
-            strength = (
-                (fr_left - en_left)
-                + (en_right - fr_right)
-            )
-
-            if best is None or strength > best[0]:
-                best = (strength, left, right)
-
-    if best:
-        return [best[1], best[2]]
-
-    return [text]
-
-
-def caption_clean_piece(text):
-    text = CAPTION_MARKER_RE.sub(
-        "",
-        text,
-        count=1,
-    )
-
-    return normalize_string(text.strip())
-
-
-def extract_caption(pdf):
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    out = []
-    seen = set()
-
-    def add(page_index, text):
-        candidate = caption_clean_piece(text)
-
-        if not candidate or candidate in seen:
-            return
-
-        seen.add(candidate)
-
-        out.append(
-            (
-                pdf.pdf_name,
-                page_index,
-                "caption",
-                candidate,
-            )
-        )
-
-    for page in pages:
-        page_index = page.get("page_index", 0)
-        blocks = page.get("parsing_res_list", [])
-
-        for i, block in enumerate(blocks):
-            label = block.get("block_label")
-
-            raw = str(
-                block.get("block_content", "") or ""
-            ).strip()
-
-            if not raw:
-                continue
-
-            if (
-                label == "figure_title"
-                and CAPTION_MARKER_RE.match(raw)
-            ):
-
-                if CAPTION_MARKER_ONLY_RE.fullmatch(raw):
-
-                    for j in range(
-                        i + 1,
-                        min(i + 5, len(blocks)),
-                    ):
-                        nxt = blocks[j]
-                        nxt_label = nxt.get("block_label")
-
-                        if nxt_label in {
-                            "image",
-                            "chart",
-                            "number",
-                        }:
-                            continue
-
-                        if nxt_label != "figure_title":
-                            break
-
-                        nxt_raw = str(
-                            nxt.get(
-                                "block_content",
-                                "",
-                            ) or ""
-                        ).strip()
-
-                        if (
-                            nxt_raw
-                            and not CAPTION_MARKER_ONLY_RE.fullmatch(
-                                nxt_raw
-                            )
-                        ):
-                            add(page_index, nxt_raw)
-
-                        break
-
-                    continue
-
-                line_parts = [
-                    p.strip()
-                    for p in re.split(r"\n+", raw)
-                    if p.strip()
-                ]
-
-                for part in line_parts:
-                    cleaned = CAPTION_MARKER_RE.sub(
-                        "",
-                        part,
-                        count=1,
-                    ).strip()
-
-                    for piece in caption_split_one_line_bilingual(
-                        cleaned
-                    ):
-                        add(page_index, piece)
-
-            elif (
-                label == "header"
-                and CAPTION_MARKER_ONLY_RE.fullmatch(raw)
-            ):
-                for j in range(
-                    i + 1,
-                    min(i + 5, len(blocks)),
-                ):
-                    nxt = blocks[j]
-                    nxt_label = nxt.get("block_label")
-
-                    if nxt_label in {
-                        "image",
-                        "chart",
-                        "number",
-                    }:
-                        continue
-
-                    if nxt_label != "figure_title":
-                        break
-
-                    nxt_raw = str(
-                        nxt.get(
-                            "block_content",
-                            "",
-                        ) or ""
-                    ).strip()
-
-                    if nxt_raw:
-                        add(page_index, nxt_raw)
-
-                    break
-
-    if not out:
-        return False, []
-
-    return True, out
-
-
-def extract_email(pdf):
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    results = []
-    seen = set()
-
-    for page in pages:
-        page_index = page.get("page_index", 0)
-
-        for block in page.get("parsing_res_list", []):
-            content = str(block.get("block_content", "") or "")
-
-            for local_part, domain in GROUP_EMAIL_RE.findall(content):
-                local_part = re.sub(
-                    r"([A-Za-z0-9_.-]+)\s+([A-Za-z0-9_.-]+)",
-                    r"\1,\2",
-                    local_part,
-                )
-
-                for name in local_part.split(","):
-                    name = name.strip()
-
-                    if not name:
-                        continue
-
-                    email = normalize_text(f"{name}@{domain}")
-
-                    if not email or email in seen:
-                        continue
-
-                    seen.add(email)
-
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            page_index,
-                            "email",
-                            email,
-                        )
-                    )
-
-            for match in EMAIL_RE.findall(content):
-                email = normalize_text(match)
-
-                if not email or email in seen:
-                    continue
-
-                seen.add(email)
-
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        page_index,
-                        "email",
-                        email,
-                    )
-                )
-
-    if not results:
-        return False, []
-
-    return True, results
-
-
-
-KEYWORD_PREFIX_RE = re.compile(
-    r"(?i)^\s*"
-    r"(?:"
-    r"mots?\s*[-‐-‒–—]?\s*cl[ée]s?"
-    r"|key\s*words?\s+and\s+phrases?"
-    r"|key\s*words?"
-    r"|keywords?"
-    r"|index\s+terms?"
-    r"|palabras\s+clave"
-    r")"
-    r"\s*(?:[:：.•·\-–—]\s*)?"
-)
-
-
-
-
-def _parse_keyword_payload(text):
-    text = str(text or "").split("|")[0]
-
-    text = re.split(
-        r"(?i)\b(?:"
-        r"JEL\s+Classification|"
-        r"Mathematics\s+Subject\s+Classification|"
-        r"MSC"
-        r")\b",
-        text,
-        maxsplit=1,
-    )[0]
-
-    text = re.sub(r"[—–·;]", ",", text)
-
-    out = []
-
-    for raw_keyword in text.split(","):
-        value = raw_keyword.strip()
-        value = re.sub(r"[.;:•·]+$", "", value).strip()
-        value = normalize_text(value)
-
-        if value:
-            out.append(value)
-
-    return out
-
-
-def extract_keyword(pdf):
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    results = []
-
-    for page in pages:
-        page_index = page.get("page_index", 0)
-        blocks = page.get("parsing_res_list", [])
-        waiting = False
-
-        for block in blocks:
-            label = str(block.get("block_label", "") or "")
-            content = str(block.get("block_content", "") or "").strip()
-
-            if not content:
-                continue
-
-            if label == "paragraph_title":
-                low = content.lower()
-
-                if (
-                    "keyword" in low
-                    or "key word" in low
-                    or "index term" in low
-                    or "mot clé" in low
-                    or "mots clé" in low
-                    or "palabras clave" in low
-                ):
-                    waiting = True
-                    continue
-
-            if waiting:
-                if label != "text":
-                    continue
-
-                for value in _parse_keyword_payload(content):
-                    results.append(
-                        (pdf.pdf_name, page_index, "keyword", value)
-                    )
-
-                waiting = False
-                continue
-
-            if label != "text":
-                continue
-
-            match = KEYWORD_PREFIX_RE.match(content)
-
-            if not match:
-                continue
-
-            payload = content[match.end():].strip()
-
-            for value in _parse_keyword_payload(payload):
-                results.append(
-                    (pdf.pdf_name, page_index, "keyword", value)
-                )
-
-    if not results:
-        return False, []
-
-    return True, results
-
-
-
-AFF_INST_RE = re.compile(
-    r"(?i)\b("
-    r"universit(?:y|é|e|ät)|"
-    r"école|ecole|school|"
-    r"faculté|faculte|faculty|"
-    r"département|departement|department|"
-    r"institut|institute|"
-    r"laboratoire|laboratory|"
-    r"centre|center|"
-    r"chaire|"
-    r"cnrs|umr\b|ehess\b|"
-    r"cégep|cegep|college|collège|"
-    r"google|deepmind|meta|microsoft|amazon|apple|ibm|"
-    r"nvidia|intel|adobe|bytedance|huawei|qualcomm|"
-    r"salesforce|oracle|caltech|technion|"
-    r"academy|hospital|dipartimento|lab"
-    r")"
-)
-
-AFF_FIELD_RE = re.compile(
-    r"(?i)\b("
-    r"engineering|"
-    r"computer\s+science|"
-    r"physics|"
-    r"mathematics"
-    r")\b"
-)
-
-
-AFF_ROLE_RE = re.compile(
-    r"(?i)\b("
-    r"professeur|professeure|professor|"
-    r"étudiant|étudiante|etudiant|etudiante|student|"
-    r"candidate au doctorat|"
-    r"boursier|boursière|boursiere|"
-    r"chercheur|chercheure|researcher|"
-    r"coordonnateur|coordonnatrice|"
-    r"spécialiste|specialiste|"
-    r"animatrice|animateur|"
-    r"auxiliaire de recherche|"
-    r"avocat-conseil|"
-    r"forensic auditor"
-    r")"
-)
-
-AFF_DEGREE_RE = re.compile(
-    r"(?i)\b("
-    r"ll\.\s*b\.|ll\.\s*m\.|"
-    r"m\.\s*st\.|d\.\s*phil\.|"
-    r"ph\.?\s*d\.?|"
-    r"b\.\s*sc\.?|m\.\s*sc\.?|"
-    r"b\.\s*a\.?|m\.\s*a\.?|"
-    r"b\.\s*ed\.?|m\.\s*s\.\s*s\."
-    r")"
-)
-
-AFF_LATEX_MARKER_RE = re.compile(
-    r"\$\s*\^\s*\{([^{}]+)\}\s*\$"
-)
-
-AFF_UNICODE_MARKERS = {
-    "¹": "1",
-    "²": "2",
-    "³": "3",
-    "⁴": "4",
-    "⁵": "5",
-    "⁶": "6",
-    "⁷": "7",
-    "⁸": "8",
-    "⁹": "9",
-}
-
-AFF_STOP_RE = re.compile(
-    r"(?i)\s+(?="
-    r"une version antérieure|"
-    r"une version anterieure|"
-    r"l['’]auteur(?:e)?\b|"
-    r"the author\b|"
-    r"cet article\b"
-    r")"
-)
-
-
-def _ordered_blocks(page):
-    return sorted(
-        page.get("parsing_res_list", []),
-        key=lambda b: (
-            b.get("block_order") is None,
-            b.get("block_order")
-            if b.get("block_order") is not None
-            else float("inf"),
-        ),
-    )
-
-
-def _strip_email(text):
-    return EMAIL_RE.sub(" ", str(text or ""))
-
-
-def _clean_affiliation(text):
-    text = unicodedata.normalize("NFKC", str(text or ""))
-    text = _strip_email(text)
-
-    text = AFF_STOP_RE.split(text, maxsplit=1)[0]
-
-    text = AFF_LATEX_MARKER_RE.sub(" ", text)
-
-    for char in AFF_UNICODE_MARKERS:
-        text = text.replace(char, " ")
-
-    text = re.sub(r"\s+", " ", text)
-    text = text.strip(" \t\r\n,;:.–—-")
-
-    return normalize_text(text)
-
-
-def _first_affiliation_cue(text):
-    matches = []
-
-    m = AFF_ROLE_RE.search(text)
-    if m:
-        matches.append(m)
-
-    m = AFF_INST_RE.search(text)
-    if m:
-        matches.append(m)
-
-    if not matches:
-        return None
-
-    return min(matches, key=lambda x: x.start())
-
-
-def _strip_author_prefix(text):
-    text = str(text or "")
-    cue = _first_affiliation_cue(text)
-
-    if not cue:
-        return text
-
-    prefix = text[:cue.start()].strip(" ,;:-")
-    words = prefix.split()
-
-    if (
-        prefix
-        and len(words) <= 8
-        and not AFF_INST_RE.search(prefix)
-        and not AFF_ROLE_RE.search(prefix)
-    ):
-        return text[cue.start():]
-
-    return text
-
-
-def _author_marker_counts(text):
-    counts = {}
-
-    for raw in AFF_LATEX_MARKER_RE.findall(str(text or "")):
-        marker = re.sub(r"[^0-9]", "", raw)
-
-        if marker:
-            counts[marker] = counts.get(marker, 0) + 1
-
-    for char, marker in AFF_UNICODE_MARKERS.items():
-        n = str(text or "").count(char)
-
-        if n:
-            counts[marker] = counts.get(marker, 0) + n
-
-    return counts
-
-
-def _rough_author_count(text):
-    text = str(text or "")
-
-    text = AFF_LATEX_MARKER_RE.sub("", text)
-
-    for char in AFF_UNICODE_MARKERS:
-        text = text.replace(char, "")
-
-    text = text.replace("*", " ")
-
-    parts = [
-        p.strip()
-        for p in text.split(",")
-        if p.strip()
-    ]
-
-    return len(parts)
-
-
-def _split_role_segments(text):
-    text = str(text or "")
-
-    pieces = []
-
-    for semicolon_piece in text.split(";"):
-        semicolon_piece = semicolon_piece.strip()
-
-        if not semicolon_piece:
-            continue
-
-        starts = [
-            m.start()
-            for m in AFF_ROLE_RE.finditer(semicolon_piece)
-        ]
-
-        if len(starts) <= 1:
-            pieces.append(semicolon_piece)
-            continue
-
-        boundaries = [0]
-
-        for pos in starts[1:]:
-            boundaries.append(pos)
-
-        boundaries.append(len(semicolon_piece))
-
-        for a, b in zip(boundaries, boundaries[1:]):
-            part = semicolon_piece[a:b].strip()
-
-            if part:
-                pieces.append(part)
-
-    return pieces
-
-
-def _split_numbered_affiliations(text):
-    text = str(text or "")
-
-    matches = list(AFF_LATEX_MARKER_RE.finditer(text))
-
-    if not matches:
-        return []
-
-    result = []
-
-    for i, m in enumerate(matches):
-        marker_raw = m.group(1)
-        marker = re.sub(r"[^0-9]", "", marker_raw)
-
-        if not marker:
-            continue
-
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-
-        value = text[start:end].strip()
-
-        if value:
-            result.append((marker, value))
-
-    return result
-
-
-def _split_repeated_university(text):
-    pattern = re.compile(r"(?i)\b(?:université|university|universitat|universität)\b")
-    matches = list(pattern.finditer(text))
-
-    if len(matches) < 2:
-        return [text]
-
-    parts = []
-    start = 0
-
-    for m in matches[1:]:
-        part = text[start:m.start()].strip(" ,;")
-
-        if part:
-            parts.append(part)
-
-        start = m.start()
-
-    last = text[start:].strip(" ,;")
-
-    if last:
-        parts.append(last)
-
-    return parts
-
-
-def _is_affiliation_candidate(text):
-    text = str(text or "")
-
-    field_candidate = (
-        len(text.split()) <= 18
-        and AFF_FIELD_RE.search(text)
-    )
-
-    return bool(
-        AFF_INST_RE.search(text)
-        or AFF_ROLE_RE.search(text)
-        or AFF_DEGREE_RE.search(text)
-        or field_candidate
-    )
-
-
-
-def _front_matter_blocks(page):
-    result = []
-
-    for block in _ordered_blocks(page):
-        label = block.get("block_label")
-        content = str(block.get("block_content", "") or "").strip()
-
-        if not content:
-            continue
-
-        if label == "abstract":
+    def marker_tokens(content):
+        """
+        Convert marker contents such as:
+        1
+        a
+        1,2
+        a,b
+        2,*
+        into generic marker tokens.
+        """
+        tokens = re.split(r"[\s,;/]+", str(content).strip())
+        return {
+            token.strip().lower()
+            for token in tokens
+            if token.strip()
+        }
+
+    # ------------------------------------------------------------
+    # Build author -> superscript-marker relationships.
+    #
+    # This is based only on document structure:
+    # each extracted author is located in the raw author block and
+    # superscript markers occurring after that author and before the
+    # next author are assigned to that author.
+    # ------------------------------------------------------------
+    marker_to_authors = {}
+
+    for b in blocks:
+        label = b.get("block_label")
+
+        if label in {"abstract", "paragraph_title"}:
             break
-
-        if (
-            label == "paragraph_title"
-            and re.search(
-                r"(?i)\b(résumé|resume|abstract)\b",
-                content,
-            )
-        ):
-            break
-
-        if (
-            label == "text"
-            and len(content) >= 260
-            and len(result) >= 2
-            and not _is_affiliation_candidate(content)
-        ):
-            break
-
-        if (
-            label == "text"
-            and len(content) >= 420
-            and len(result) >= 1
-            and len(content.split()) > 60
-        ):
-            break
-
-        result.append(block)
-
-    return result
-
-
-AFF_METADATA_ITEM_START_RE = re.compile(
-    r"(?i)"
-    r"(?:"
-    r"ph\.?\s*d\.?|"
-    r"ll\.\s*b\.|ll\.\s*m\.|"
-    r"m\.\s*st\.|d\.\s*phil\.|"
-    r"professeur(?:e)?(?:\s+\w+){0,2}|"
-    r"titulaire\b|"
-    r"chercheur(?:e)?\b|"
-    r"candidate?\s+au\s+doctorat|"
-    r"boursi(?:er|ère|ere)\b|"
-    r"baccalauréat\b|baccalaureat\b|"
-    r"maîtrise\b|maitrise\b|"
-    r"auxiliaire\s+de\s+recherche|"
-    r"coordonnat(?:eur|rice)\b|"
-    r"spécialiste\b|specialiste\b|"
-    r"animat(?:eur|rice)\b|"
-    r"avocat-conseil\b|"
-    r"forensic\s+auditor\b"
-    r")"
-)
-
-
-def _clean_footnote_prefix(text):
-    text = str(text or "").strip()
-
-    text = re.sub(
-        r"^\s*\$\s*\^\s*\{[^{}]*\}\s*\$\s*",
-        "",
-        text,
-    )
-
-    text = re.sub(r"^\s*\*+\s*", "", text)
-    text = re.sub(r"^\s*\d+\s*[.)]\s*", "", text)
-
-    return text.strip()
-
-
-def _split_metadata_affiliation_items(text):
-    text = str(text or "").strip()
-
-    if not text:
-        return []
-
-    matches = list(AFF_METADATA_ITEM_START_RE.finditer(text))
-
-    if not matches:
-        return [text] if _is_affiliation_candidate(text) else []
-
-    starts = []
-
-    for m in matches:
-        pos = m.start()
-
-        matched = m.group(0).lower()
-
-        if (
-            re.match(r"ma[iî]trise\b", matched)
-            and re.search(r"\bet\s*$", text[:pos], re.IGNORECASE)
-        ):
-            continue
-
-        if not starts or pos != starts[-1]:
-            starts.append(pos)
-
-    pieces = []
-
-    for i, start in enumerate(starts):
-        end = starts[i + 1] if i + 1 < len(starts) else len(text)
-        piece = text[start:end].strip(" ,;")
-
-        if piece:
-            pieces.append(piece)
-
-    return pieces
-
-
-def _looks_like_author_plus_affiliation_block(text):
-    lines = [
-        line.strip()
-        for line in str(text or "").splitlines()
-        if line.strip()
-    ]
-
-    if len(lines) < 2:
-        return False
-
-    first_line = lines[0]
-    remaining = "\n".join(lines[1:])
-
-    return (
-        not _is_affiliation_candidate(first_line)
-        and _is_affiliation_candidate(remaining)
-    )
-
-
-def _extract_page0_affiliations(pdf, page):
-    results = []
-    blocks = _front_matter_blocks(page)
-
-    previous_text_block = None
-
-    for block in blocks:
-        label = block.get("block_label")
-        content = str(block.get("block_content", "") or "").strip()
-
-        if not content:
-            continue
 
         if label != "text":
             continue
 
-        if not _is_affiliation_candidate(content):
-            previous_text_block = content
+        text = str(b.get("block_content", "")).strip()
+        if not text:
             continue
 
-        if previous_text_block:
-            prev_value = _clean_affiliation(
-                _strip_author_prefix(previous_text_block)
-            )
-            curr_value = _clean_affiliation(
-                _strip_author_prefix(content)
-            )
+        author_spans = []
 
-            merge_value = None
+        for author in author_names:
+            m = re.search(re.escape(author), text, flags=re.I)
+            if m:
+                author_spans.append((m.start(), m.end(), author))
 
-            unit_then_university = (
-                prev_value
-                and curr_value
-                and re.match(
-                    r"(?i)^(?:"
-                    r"département|departement|department|"
-                    r"laboratoire|laboratory|"
-                    r"faculté|faculte|faculty|"
-                    r"centre|center"
-                    r")\b",
-                    prev_value,
-                )
-                and re.match(
-                    r"(?i)^universit(?:é|e|y|ät)\b",
-                    curr_value,
-                )
+        if not author_spans:
+            continue
+
+        author_spans.sort(key=lambda x: x[0])
+
+        for i, (_, author_end, author) in enumerate(author_spans):
+            next_start = (
+                author_spans[i + 1][0]
+                if i + 1 < len(author_spans)
+                else len(text)
             )
 
-            role_then_institution = (
-                prev_value
-                and curr_value
-                and len(prev_value.split()) <= 8
-                and AFF_ROLE_RE.search(prev_value)
-                and not AFF_INST_RE.search(prev_value)
-                and AFF_INST_RE.search(curr_value)
-            )
+            segment = text[author_end:next_start]
 
-            general_adjacent_affiliation = (
-                prev_value
-                and curr_value
-                and len(prev_value.split()) <= 12
-                and len(curr_value.split()) <= 18
-                and _is_affiliation_candidate(prev_value)
-                and _is_affiliation_candidate(curr_value)
-                and (
-                    AFF_INST_RE.search(prev_value)
-                    or AFF_INST_RE.search(curr_value)
-                )
-                and not EMAIL_RE.search(prev_value)
-                and not EMAIL_RE.search(curr_value)
-                and _rough_author_count(prev_value) < 2
-                and not _looks_like_author_plus_affiliation_block(
-                    previous_text_block
-                )
-                and not _looks_like_author_plus_affiliation_block(
-                    content
-                )
-            )
+            for mm in any_marker.finditer(segment):
+                for token in marker_tokens(mm.group(1)):
+                    marker_to_authors.setdefault(token, set()).add(author)
 
-            if (
-                unit_then_university
-                or role_then_institution
-                or general_adjacent_affiliation
-            ):
-                merge_value = _clean_affiliation(
-                    f"{prev_value}, {curr_value}"
-                )
+    out = []
+    main_affiliations = []
+    memberships = []
 
-            if merge_value:
-                if results and results[-1][3] == prev_value:
-                    results.pop()
+    current = None
+    current_multiplier = 1
 
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        page.get("page_index", 0),
-                        "affiliation",
-                        merge_value,
-                    )
-                )
+    # Multiplier associated with the most recent explicit affiliation
+    # marker. It can continue across an immediately following block.
+    active_marker_multiplier = 1
 
-                previous_text_block = content
-                continue
+    saw_affiliation_marker = False
 
-        numbered = _split_numbered_affiliations(content)
+    def flush():
+        nonlocal current
 
-        if numbered:
-            counts = _author_marker_counts(previous_text_block or "")
+        if current:
+            value = current.strip(" ,;.")
 
-            author_count = _rough_author_count(
-                previous_text_block or ""
-            )
+            if value:
+                main_affiliations.append(value)
 
-            for marker, raw_value in numbered:
-                value = _clean_affiliation(raw_value)
+                # Preserve benchmark multiplicity:
+                # one affiliation may belong to several authors.
+                out.extend([value] * max(1, current_multiplier))
 
-                if not value:
-                    continue
+        current = None
 
-                repeat = counts.get(marker, 0)
+    for b in blocks:
+        label = b.get("block_label")
 
-                if (
-                    repeat == 0
-                    and len(numbered) == 1
-                    and 2 <= author_count <= 8
-                    and not _is_affiliation_candidate(
-                        previous_text_block or ""
-                    )
-                ):
-                    repeat = author_count
-
-                if repeat <= 0:
-                    repeat = 1
-
-                for _ in range(repeat):
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            page.get("page_index", 0),
-                            "affiliation",
-                            value,
-                        )
-                    )
-
-            previous_text_block = content
-            continue
-
-        marker_counts = _author_marker_counts(
-            previous_text_block or ""
-        )
-        unique_markers = sorted(marker_counts)
-
-        raw_parts = [content]
-
-        if len(unique_markers) > 1:
-            raw_parts = _split_repeated_university(content)
-
-        final_parts = []
-
-        for raw_part in raw_parts:
-            final_parts.extend(
-                _split_role_segments(raw_part)
-            )
-
-        cleaned_parts = []
-
-        for raw_part in final_parts:
-            raw_part = _strip_author_prefix(raw_part)
-            value = _clean_affiliation(raw_part)
-
-            if value and _is_affiliation_candidate(value):
-                cleaned_parts.append(value)
-
-        if (
-            len(cleaned_parts) == 1
-            and previous_text_block
-            and not marker_counts
-        ):
-            author_count = _rough_author_count(
-                previous_text_block
-            )
-
-            if (
-                2 <= author_count <= 8
-                and not _is_affiliation_candidate(
-                    previous_text_block
-                )
-            ):
-                for _ in range(author_count):
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            page.get("page_index", 0),
-                            "affiliation",
-                            cleaned_parts[0],
-                        )
-                    )
-
-                previous_text_block = content
-                continue
-
-        if (
-            cleaned_parts
-            and marker_counts
-            and len(cleaned_parts) == len(unique_markers)
-        ):
-            for value, marker in zip(
-                cleaned_parts,
-                unique_markers,
-            ):
-                for _ in range(
-                    marker_counts.get(marker, 1)
-                ):
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            page.get("page_index", 0),
-                            "affiliation",
-                            value,
-                        )
-                    )
-
-            previous_text_block = content
-            continue
-
-        for value in cleaned_parts:
-            results.append(
-                (
-                    pdf.pdf_name,
-                    page.get("page_index", 0),
-                    "affiliation",
-                    value,
-                )
-            )
-
-        previous_text_block = content
-
-    for block in _ordered_blocks(page):
-        if block.get("block_label") != "footnote":
-            continue
-
-        content = str(
-            block.get("block_content", "") or ""
-        ).strip()
-
-        if not content:
-            continue
-
-        content = _clean_footnote_prefix(content)
-
-        content = AFF_STOP_RE.split(content, maxsplit=1)[0].strip()
-
-        if not content:
-            continue
-
-        beginning = content[:140]
-
-        if not (
-            AFF_DEGREE_RE.match(beginning)
-            or AFF_ROLE_RE.match(beginning)
-            or AFF_INST_RE.match(beginning)
-        ):
-            continue
-
-        pieces = [
-            p.strip()
-            for p in content.split(";")
-            if p.strip()
-        ]
-
-        for piece in pieces:
-            piece = _clean_footnote_prefix(piece)
-            piece = _strip_author_prefix(piece)
-            value = _clean_affiliation(piece)
-
-            if not value:
-                continue
-
-            if not _is_affiliation_candidate(value):
-                continue
-
-            results.append(
-                (
-                    pdf.pdf_name,
-                    page.get("page_index", 0),
-                    "affiliation",
-                    value,
-                )
-            )
-
-    return results
-
-
-def _extract_late_metadata(pdf, page):
-    results = []
-    page_index = page.get("page_index", 0)
-
-    if page_index == 0:
-        return results
-
-    blocks = _ordered_blocks(page)
-
-    for block in blocks:
-        if block.get("block_label") != "text":
-            continue
-
-        content = str(
-            block.get("block_content", "") or ""
-        ).strip()
-
-        if not content or len(content) > 220:
-            continue
-
-        if not AFF_ROLE_RE.search(content):
-            continue
-
-        if not AFF_INST_RE.search(content):
-            continue
-
-        if re.search(r"(?i)https?://|www\.", content):
-            continue
-
-        if (
-            len(re.findall(r"[.!?]", content)) >= 2
-            and len(content.split()) > 22
-        ):
-            continue
-
-        value = _clean_affiliation(
-            _strip_author_prefix(content)
-        )
-
-        if value:
-            results.append(
-                (
-                    pdf.pdf_name,
-                    page_index,
-                    "affiliation",
-                    value,
-                )
-            )
-
-    for block in blocks:
-        if block.get("block_label") != "text":
-            continue
-
-        content = str(
-            block.get("block_content", "") or ""
-        ).strip()
-
-        if not content or len(content) > 320:
-            continue
-
-        if not EMAIL_RE.search(content):
-            continue
-
-        if not AFF_INST_RE.search(content):
-            continue
-
-        value = _clean_affiliation(
-            _strip_author_prefix(content)
-        )
-
-        if value and _is_affiliation_candidate(value):
-            results.append(
-                (
-                    pdf.pdf_name,
-                    page_index,
-                    "affiliation",
-                    value,
-                )
-            )
-
-    for email_i, block in enumerate(blocks):
-        email_content = str(
-            block.get("block_content", "") or ""
-        )
-
-        if not EMAIL_RE.search(email_content):
-            continue
-
-        cluster = []
-        j = email_i - 1
-
-        while j >= 0 and len(cluster) < 9:
-            prev = blocks[j]
-
-            if prev.get("block_label") != "text":
-                break
-
-            content = str(
-                prev.get("block_content", "") or ""
-            ).strip()
-
-            if not content:
-                break
-
-            if len(content) > 220:
-                break
-
-            cluster.append(content)
-            j -= 1
-
-        cluster.reverse()
-
-        if len(cluster) < 2:
-            continue
-
-        cue_indices = [
-            i
-            for i, value in enumerate(cluster)
-            if AFF_INST_RE.search(value)
-            or AFF_ROLE_RE.search(value)
-        ]
-
-        if not cue_indices:
-            continue
-
-        metadata = cluster[cue_indices[0]:]
-
-        if len(metadata) < 2:
-            continue
-
-        if not any(
-            AFF_INST_RE.search(value)
-            for value in metadata
-        ):
-            continue
-
-        value = _clean_affiliation(
-            ", ".join(metadata)
-        )
-
-        if value:
-            results.append(
-                (
-                    pdf.pdf_name,
-                    page_index,
-                    "affiliation",
-                    value,
-                )
-            )
-
-    reference_heading_i = None
-
-    for i, block in enumerate(blocks):
-        if block.get("block_label") != "paragraph_title":
-            continue
-
-        heading = str(
-            block.get("block_content", "") or ""
-        ).strip()
-
-        if re.fullmatch(
-            r"(?i)\s*(?:"
-            r"références|references|"
-            r"bibliographie|bibliography"
-            r")\s*",
-            heading,
-        ):
-            reference_heading_i = i
+        if label in {"abstract", "paragraph_title"}:
             break
 
-    if reference_heading_i is not None:
-        start = max(0, reference_heading_i - 8)
-        region = blocks[start:reference_heading_i]
-
-        metadata_blocks = []
-
-        for block in region:
-            if block.get("block_label") not in {
-                "text",
-                "reference_content",
-            }:
-                continue
-
-            content = str(
-                block.get("block_content", "") or ""
-            ).strip()
-
-            if not content or len(content) > 700:
-                continue
-
-            if (
-                AFF_METADATA_ITEM_START_RE.search(content)
-                or AFF_ROLE_RE.search(content)
-                or AFF_DEGREE_RE.search(content)
-            ):
-                metadata_blocks.append(content)
-
-        if len(metadata_blocks) >= 2:
-            for content in metadata_blocks:
-                for piece in _split_metadata_affiliation_items(
-                    content
-                ):
-                    value = _clean_affiliation(piece)
-
-                    if not value:
-                        continue
-
-                    if not (
-                        _is_affiliation_candidate(value)
-                        or AFF_METADATA_ITEM_START_RE.search(value)
-                    ):
-                        continue
-
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            page_index,
-                            "affiliation",
-                            value,
-                        )
-                    )
-
-    return results
-
-def extract_affiliation(pdf):
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    results = []
-    page0_values = set()
-
-    for page in pages:
-        page_index = page.get("page_index", 0)
-
-        if page_index == 0:
-            page0_results = _extract_page0_affiliations(
-                pdf,
-                page,
-            )
-
-            results.extend(page0_results)
-
-            page0_values.update(
-                row[3]
-                for row in page0_results
-            )
-
-        else:
-            late_results = _extract_late_metadata(
-                pdf,
-                page,
-            )
-
-            for row in late_results:
-                if row[3] in page0_values:
-                    continue
-
-                results.append(row)
-
-    if not results:
-        return False, []
-
-    return True, results
-
-
-
-
-def _clean_author_superscripts(text):
-    text = str(text or "")
-
-    text = re.sub(
-        r"\$\s*\^\{[^}]*\}\s*\$",
-        "",
-        text,
-    )
-
-    text = re.sub(
-        r"[¹²³⁴⁵⁶⁷⁸⁹⁰*]+",
-        "",
-        text,
-    )
-
-    return text
-
-
-def _author_name_like(text):
-    text = str(text or "").strip()
-
-    if not text:
-        return False
-
-    if len(text) > 170:
-        return False
-
-    if re.search(r"[@!?;:]", text):
-        return False
-
-    if re.search(r"\d", text):
-        return False
-
-    words = re.findall(
-        r"[A-Za-zÀ-ÖØ-öø-ÿŒœ'’.-]+",
-        text,
-    )
-
-    if len(words) < 2 or len(words) > 8:
-        return False
-
-    letters = re.sub(
-        r"[^A-Za-zÀ-ÖØ-öø-ÿŒœ]",
-        "",
-        text,
-    )
-
-    return len(letters) >= 4
-
-
-def _clean_single_author(value):
-    value = str(value or "").strip()
-
-    value = _clean_author_superscripts(value)
-
-    value = re.sub(
-        r"(?i)^\s*(?:par|by)\s+",
-        "",
-        value,
-    )
-
-    value = re.sub(
-        r"(?i)\s*,?\s*"
-        r"(?:ph\.?\s*d\.?|t\.?\s*s\.?)"
-        r"(?:\s+[A-Z.]{1,8})*\s*$",
-        "",
-        value,
-    )
-
-    value = re.sub(r"\s+", " ", value).strip(" ,;")
-
-    m = re.fullmatch(
-        r"\s*([^,]+),\s*([^,]+)\s*",
-        value,
-    )
-
-    if m:
-        family = m.group(1).strip()
-        given = m.group(2).strip()
-
-        if (
-            _author_name_like(family + " " + given)
-            and family.upper() == family
-        ):
-            value = given + " " + family
-
-    value = re.sub(r"\s+", " ", value).strip()
-
-    return value.lower()
-
-
-def _split_author_line(line):
-    line = str(line or "").strip()
-
-    if not line:
-        return []
-
-    surname_probe = _clean_author_superscripts(line)
-
-    surname_probe = re.sub(
-        r"(?i)\s*,?\s*"
-        r"(?:ph\.?\s*d\.?|t\.?\s*s\.?)"
-        r"(?:\s+[A-Z.]{1,8})*\s*$",
-        "",
-        surname_probe,
-    )
-
-    surname_probe = re.sub(
-        r"\s+",
-        " ",
-        surname_probe,
-    ).strip(" ,;")
-
-    if surname_probe.count(",") == 1:
-        family, given = [
-            x.strip()
-            for x in surname_probe.split(",", 1)
-        ]
-
-        if (
-            family
-            and given
-            and family.upper() == family
-            and _author_name_like(family + " " + given)
-        ):
-            value = _clean_single_author(surname_probe)
-
-            if value and _author_name_like(value):
-                return [value]
-
-    line = re.sub(r"<[^>]+>", " ", line)
-
-    line = re.sub(
-        r"\$\s*\{?\s*\}\?\s*\^\{[^}]*\}\s*\$",
-        ", ",
-        line,
-    )
-    line = re.sub(
-        r"\$\s*\^\{[^}]*\}\s*\$",
-        ", ",
-        line,
-    )
-    line = re.sub(
-        r"\^\{[^}]*\}",
-        ", ",
-        line,
-    )
-
-    line = line.replace("$", " ")
-
-    line = re.sub(
-        r"\s*[*†‡§¶]+\s*",
-        ", ",
-        line,
-    )
-
-    line = re.sub(
-        r"(?i)^\s*(?:par|by)\s+",
-        "",
-        line,
-    ).strip()
-
-    line = re.sub(r"\s+", " ", line).strip(" ,;")
-
-    conjunction_parts = [
-        part.strip(" ,;")
-        for part in re.split(
-            r"\s+(?:and|et|&)\s+",
-            line,
-            flags=re.IGNORECASE,
-        )
-        if part.strip(" ,;")
-    ]
-
-    if len(conjunction_parts) > 1:
-        authors = []
-
-        for part in conjunction_parts:
-            for value in _split_author_line(part):
-                if value and value not in authors:
-                    authors.append(value)
-
-        return authors
-
-    raw_parts = [
-        p.strip(" ,;")
-        for p in line.split(",")
-        if p.strip(" ,;")
-    ]
-
-    if len(raw_parts) == 2:
-        family, given = raw_parts
-
-        combined = family + ", " + given
-        value = _clean_single_author(combined)
-
-        if value and _author_name_like(value):
-            return [value]
-
-    authors = []
-
-    for part in raw_parts if raw_parts else [line]:
-        part = part.strip()
-
-        if not part:
+        if label != "text":
             continue
 
-        words = part.split()
+        text = str(b.get("block_content", "")).strip()
+        if not text:
+            continue
 
-        initials = sum(
-            1
-            for w in words
-            if re.fullmatch(r"[A-Z]\.", w)
-        )
+        # Professional memberships may themselves be affiliation GT.
+        for m in member.finditer(text):
+            value = normalize_string(m.group(0))
+            if value:
+                memberships.append(value)
 
-        particles = {
-            "van", "von", "de", "del",
-            "der", "di", "da",
-        }
+        ends_with_semicolon = text.rstrip().endswith(";")
 
-        compact_parts = [part]
+        if stop.search(text):
+            flush()
+            active_marker_multiplier = 1
+            continue
 
-        if (
-            len(words) >= 4
-            and len(words) % 2 == 0
-            and initials < 2
-            and part != part.upper()
-            and not any(
-                w.lower() in particles
-                for w in words
-            )
-            and all(
-                len(w) > 1
-                and not (
-                    len(w) == 2
-                    and w.endswith(".")
-                )
-                for w in words
-            )
-        ):
-            compact_parts = [
-                words[i] + " " + words[i + 1]
-                for i in range(0, len(words), 2)
+        text = re.sub(
+            r"(?:E-?mail\s*:?\s*)?"
+            r"\{?[\w.+-]+(?:\s*,\s*[\w.+-]+)*\}?"
+            r"@[\w.-]+\.[A-Za-z]{2,}",
+            "",
+            text,
+            flags=re.I,
+        ).strip(" ,;.")
+
+        if not text:
+            continue
+
+        marker_match = marker.match(text)
+        has_marker = marker_match is not None
+
+        if has_marker:
+            saw_affiliation_marker = True
+
+            # Precision-aware marker mapping:
+            # only one simple alphanumeric affiliation marker is allowed
+            # to create multiplicity. Symbolic markers such as "*" are
+            # commonly author-status/correspondence markers and are not
+            # reliable affiliation identities.
+            affiliation_tokens = [
+                token
+                for token in marker_tokens(marker_match.group(1))
+                if re.fullmatch(r"(?:[a-z]{1,3}|\d{1,3})", token, re.I)
             ]
 
-        for candidate in compact_parts:
-            value = _clean_single_author(candidate)
+            linked_authors = set()
 
-            if not value:
-                continue
-
-            if not _author_name_like(value):
-                continue
-
-            if value not in authors:
-                authors.append(value)
-
-    return authors
-
-
-
-def _author_first_line(content):
-    lines = [
-        line.strip()
-        for line in str(content or "").splitlines()
-        if line.strip()
-    ]
-
-    if not lines:
-        return ""
-
-    return lines[0]
-
-
-def extract_author(pdf):
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    page0 = None
-
-    for page in pages:
-        if page.get("page_index", 0) == 0:
-            page0 = page
-            break
-
-    if page0 is None:
-        return False, []
-
-    blocks = _front_matter_blocks(page0)
-
-    results = []
-    author_started = False
-
-    for i, block in enumerate(blocks):
-        label = block.get("block_label")
-
-        if label not in {"text", "paragraph_title"}:
-            continue
-
-        content = str(
-            block.get("block_content", "") or ""
-        ).strip()
-
-        if not content:
-            continue
-
-        first_line = _author_first_line(content)
-
-        if not first_line:
-            continue
-
-        has_metadata_after_name = (
-            "\n" in content
-            and (
-                AFF_INST_RE.search(content)
-                or AFF_ROLE_RE.search(content)
-                or EMAIL_RE.search(content)
-            )
-        )
-
-        candidate_line = (
-            first_line
-            if has_metadata_after_name
-            else content
-        )
-
-        candidate_line = candidate_line.strip()
-
-        if (
-            AFF_INST_RE.search(candidate_line)
-            or AFF_ROLE_RE.search(candidate_line)
-            or EMAIL_RE.search(candidate_line)
-        ):
-            continue
-
-        prefixed_author = bool(
-            re.match(
-                r"(?i)^\s*(?:par|by)\s+",
-                candidate_line,
-            )
-        )
-
-        has_author_marker = bool(
-            re.search(
-                r"\$\s*\^\{[^}]*\}\s*\$|"
-                r"[¹²³⁴⁵⁶⁷⁸⁹⁰]",
-                candidate_line,
-            )
-        )
-
-        simple_name = _author_name_like(
-            _clean_author_superscripts(
-                candidate_line
-            )
-        )
-
-        candidate = (
-            prefixed_author
-            or has_metadata_after_name
-            or (
-                has_author_marker
-                and len(candidate_line) <= 500
-            )
-            or simple_name
-        )
-
-        if not candidate:
-            if author_started:
-                if (
-                    label == "text"
-                    and not AFF_INST_RE.search(content)
-                    and not AFF_ROLE_RE.search(content)
-                    and not EMAIL_RE.search(content)
-                ):
-                    break
-
-            continue
-
-        authors = _split_author_line(
-            candidate_line
-        )
-
-        if not authors:
-            continue
-
-        if not author_started:
-            if not (
-                has_metadata_after_name
-                or prefixed_author
-                or has_author_marker
-                or (
-                    simple_name
-                    and len(
-                        candidate_line.split()
-                    ) <= 8
+            if len(affiliation_tokens) == 1:
+                linked_authors.update(
+                    marker_to_authors.get(affiliation_tokens[0], set())
                 )
-            ):
-                continue
 
-        for value in authors:
-            if not value:
-                continue
-
-            results.append(
-                (
-                    pdf.pdf_name,
-                    0,
-                    "author",
-                    value,
-                )
+            # Duplicate only for an unambiguous one-marker mapping that
+            # explicitly links more than one extracted author.
+            active_marker_multiplier = (
+                len(linked_authors)
+                if len(linked_authors) > 1
+                else 1
             )
 
-        author_started = True
-
-    if not results:
-        return False, []
-
-    return True, results
-
-
-SECTION_NON_SECTION_RE = re.compile(
-    r"(?ix)^\s*(?:"
-    r"(?:résumé|resume|abstract|resumen)"
-    r"(?:\s*(?:\||[-–—])\s*(?:résumé|resume|abstract|resumen))*"
-    r"|références?"
-    r"|references?"
-    r"|références?\s+bibliographiques?"
-    r"|references?\s+bibliographiques?"
-    r"|bibliographie"
-    r"|bibliography"
-    r"|notes?"
-    r"|remerciements?"
-    r"|acknowledgements?"
-    r"|acknowledgments?"
-    r"|sources?\s+(?:consultées|électroniques)"
-    r")\s*:?\s*$"
-)
-
-SECTION_RUNNING_HEADER_RE = re.compile(
-    r"(?i)\b(?:printemps|été|ete|automne|hiver)\s+\d{4}\b"
-)
-
-
-SECTION_BYLINE_RE = re.compile(
-    r"(?i)^\s*par\s+.+$"
-)
-
-
-def extract_reference(pdf):
-
-    pages = load_all_pages(pdf)
-
-    blocks = collect_reference_blocks(pages)
-
-    first_ref_page = None
-
-    for page in pages:
-        if any(
-            b.get("block_label") == "reference_content"
-            for b in page.get("parsing_res_list", [])
-        ):
-
-            first_ref_page = page["page_index"]
-            break
-
-    if first_ref_page is not None:
-        for page in pages:
-            page_index = page["page_index"]
-
-            if page_index >= first_ref_page or first_ref_page - page_index > 8:
-                continue
-
-            for block in page.get("parsing_res_list", []):
-                if block.get("block_label") != "text":
-                    continue
-
-                text = normalize_text(block.get("block_content", ""))
-
-                if text and re.match(r"^\[\d+\]", text):
-                    blocks.append((page_index, text))
-
-    blocks.sort(key=lambda x: x[0])
-
-    if not blocks:
-        return False, []
-
-    results = []
-
-    i = 0
-
-    while i < len(blocks):
-
-        page, text = blocks[i]
-
-        while (
-            text.rstrip().endswith("-")
-            and i + 1 < len(blocks)
-        ):
-            next_page, next_text = blocks[i + 1]
-
-            stripped = next_text.lstrip()
-
-            if stripped.startswith("["):
-                break
-
-            text = text.rstrip()[:-1] + stripped
-            i += 1
-
-        results.append(
-            (
-                pdf.pdf_name,
-                page,
-                "reference",
-                text,
-            )
-        )
-
-        i += 1
-
-    return True, results
-
-def extract_section(pdf):
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    results = []
-
-    for page in pages:
-        page_index = page.get("page_index", 0)
-        blocks = page.get("parsing_res_list", [])
-
-        for i, block in enumerate(blocks):
-            if block.get("block_label") != "paragraph_title":
-                continue
-
-            text = normalize_text(
-                block.get("block_content", "")
-            )
-
-            if not text:
-                continue
-
-            if (
-                page_index == 0
-                and SECTION_BYLINE_RE.fullmatch(text)
-            ):
-                continue
-
-            if page_index == 0:
-                prev_label = None
-
-                for j in range(i - 1, -1, -1):
-                    candidate_label = blocks[j].get("block_label")
-
-                    if candidate_label in {
-                        "header",
-                        "image",
-                        "footer_image",
-                        "number",
-                    }:
-                        continue
-
-                    prev_label = candidate_label
-                    break
-
-                words = text.split()
-
-                if (
-                    prev_label == "doc_title"
-                    and 2 <= len(words) <= 6
-                    and not re.search(r"[?!:;]", text)
-                ):
-                    continue
-
-            if SECTION_NON_SECTION_RE.fullmatch(text):
-                continue
-
-            if SECTION_RUNNING_HEADER_RE.search(text):
-                continue
-
-            results.append(
-                (
-                    pdf.pdf_name,
-                    page_index,
-                    "section",
-                    text,
-                )
-            )
-
-    if not results:
-        return False, []
-
-    return True, results
-
-
-
-def _table_normalize_special(text):
-    if not text:
-        return ""
-
-    replacements = {
-        r"\pm": "±",
-        r"\times": "×",
-        r"\cdot": "·",
-        r"\leq": "≤",
-        r"\geq": "≥",
-        r"\neq": "≠",
-        r"\approx": "≈",
-        r"\propto": "∝",
-        r"\infty": "∞",
-        r"\alpha": "α",
-        r"\beta": "β",
-        r"\gamma": "γ",
-        r"\delta": "δ",
-        r"\epsilon": "ε",
-        r"\varepsilon": "ε",
-        r"\theta": "θ",
-        r"\lambda": "λ",
-        r"\mu": "μ",
-        r"\nu": "ν",
-        r"\pi": "π",
-        r"\rho": "ρ",
-        r"\sigma": "σ",
-        r"\tau": "τ",
-        r"\phi": "φ",
-        r"\omega": "ω",
-        r"\Gamma": "Γ",
-        r"\Delta": "Δ",
-        r"\Theta": "Θ",
-        r"\Lambda": "Λ",
-        r"\Pi": "Π",
-        r"\Sigma": "Σ",
-        r"\Phi": "Φ",
-        r"\Omega": "Ω",
-    }
-
-    text = text.replace("$", "")
-
-    for latex, uni in replacements.items():
-        text = text.replace(latex, uni)
-
-    text = text.replace(r"\{", "{")
-    text = text.replace(r"\}", "}")
-    text = text.replace(r"\_", "_")
-
-    text = re.sub(
-        r"\^\{\{([^{}]+)\}\}",
-        r"\1",
-        text,
-    )
-
-    text = re.sub(
-        r"\^\{([^{}]+)\}",
-        r"\1",
-        text,
-    )
-
-    text = re.sub(r"\s+", " ", text)
-
-    return normalize_string(text.strip())
-
-
-
-
-def _table_clean_cell(cell):
-    text = cell.get_text(" ", strip=True)
-
-    if not text:
-        return ""
-
-    text = text.replace("\\n", " ")
-    text = re.sub(r"^\s*[•●▪◦]\s*", "", text)
-    text = re.sub(r"\s*[•●▪◦]\s*", " ", text)
-    text = re.sub(r"\s+", " ", text)
-
-    return text.strip()
-
-
-def _table_serialize(html_content):
-    soup = BeautifulSoup(html_content, "html.parser")
-    rows = []
-
-    for row in soup.find_all("tr"):
-        cells = [
-            _table_clean_cell(cell)
-            for cell in row.find_all(["td", "th"])
+        text = marker.sub("", text).strip()
+
+        parts = [
+            x.strip(" ,;.")
+            for x in text.split(";")
+            if x.strip(" ,;.")
         ]
 
-        if cells:
-            rows.append(cells)
+        if cue.search(text) or has_marker:
+            if has_marker:
+                flush()
 
-    if not rows:
-        return normalize_string(
-            soup.get_text(" ", strip=True)
-        )
+            for i, part in enumerate(parts):
+                if i > 0:
+                    flush()
 
-    if all(len(row) == 2 for row in rows):
-        paired_heading_rows = []
+                if current is None:
+                    current = part
+                    current_multiplier = active_marker_multiplier
+                else:
+                    current = (current + " " + part).strip()
 
-        for i, row in enumerate(rows):
-            left = row[0].strip()
-            right = row[1].strip()
+            if ends_with_semicolon:
+                flush()
 
-            if (
-                left
-                and right
-                and left.endswith(":")
-                and right.endswith(":")
-            ):
-                paired_heading_rows.append(i)
-
-        if len(paired_heading_rows) >= 2:
-            parts = []
-
-            starts = paired_heading_rows
-
-            for pos, start in enumerate(starts):
-                end = (
-                    starts[pos + 1]
-                    if pos + 1 < len(starts)
-                    else len(rows)
-                )
-
-                left_parts = []
-                right_parts = []
-
-                for row in rows[start:end]:
-                    if row[0]:
-                        left_parts.append(row[0])
-
-                    if row[1]:
-                        right_parts.append(row[1])
-
-                if left_parts:
-                    parts.extend(left_parts)
-
-                if right_parts:
-                    parts.extend(right_parts)
-
-            text = " ".join(parts)
-            return _table_normalize_special(text)
-
-    parts = []
-
-    for row in rows:
-        for cell in row:
-            if cell:
-                parts.append(cell)
-
-    return _table_normalize_special(" ".join(parts))
-
-
-def extract_table(pdf):
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    results = []
-
-    for page in pages:
-        page_index = page.get("page_index", 0)
-
-        for block in page.get("parsing_res_list", []):
-            if block.get("block_label") != "table":
-                continue
-
-            html_content = block.get("block_content", "")
-
-            if not html_content:
-                continue
-
-            text = _table_serialize(html_content)
-
-            if not text:
-                continue
-
-            results.append(
-                (
-                    pdf.pdf_name,
-                    page_index,
-                    "table",
+        elif current:
+            looks_like_continuation = (
+                "," in text
+                or bool(re.search(r"\b\d{3,}\b", text))
+                or bool(re.search(
+                    r"\b(road|street|avenue|boulevard|building|campus|"
+                    r"city|state|province|country|kingdom|usa|uk|china|"
+                    r"france|germany|canada|japan|switzerland)\b",
                     text,
-                )
+                    re.I,
+                ))
             )
 
-    if not results:
-        return False, []
-
-    return True, results
-
-
-
-
-def remove_display_math(text):
-
-    text = text.replace("$$", "")
-    text = text.replace("\\[", "")
-    text = text.replace("\\]", "")
-
-    return text
-
-def remove_displaystyle(text):
-
-    return re.sub(
-        r'\\displaystyle\b',
-        '',
-        text,
-    )
-
-def remove_spacing_commands(text):
-
-    return re.sub(
-        r'\\(?:quad|qquad|,|;|!|:|enspace|thinspace|medspace|thickspace)\b',
-        '',
-        text,
-    )
-
-def remove_alignment(text):
-
-    return text.replace("&", " ")
-
-def remove_linebreaks(text):
-
-    return re.sub(
-        r'\\\\+',
-        ' ',
-        text,
-    )
-
-
-def preprocess_equation(text):
-
-    text = remove_display_math(text)
-
-    text = re.sub(
-        r'\\(?:begin|end)\{(?:aligned|align|array|cases|matrix|bmatrix|pmatrix|vmatrix|Vmatrix|smallmatrix|split|gathered?)\}',
-        '',
-        text,
-    )
-
-    text = re.sub(
-        r'\\displaylimits\b',
-        '',
-        text,
-    )
-
-    text = remove_displaystyle(text)
-
-    text = remove_spacing_commands(text)
-
-    text = remove_alignment(text)
-
-    text = remove_linebreaks(text)
-
-    text = text.replace("∈fty", "∞")
-
-    text = re.sub(r'begin\{?align\*?\}?', '', text)
-    text = re.sub(r'end\{?align\*?\}?', '', text)
-
-    text = re.sub(r'beginalign\*?', '', text)
-    text = re.sub(r'endalign\*?', '', text)
-
-    text = text.replace("parallel", "∥")
-    text = text.replace("perp", "⊥")
-
-    text = text.replace("sqrt2", "√2")
-
-    return text
-
-def unwrap_command(text, command):
-
-    pattern = rf'\\{command}\{{([^{{}}]*)\}}'
-
-    while True:
-
-        new = re.sub(pattern, r'\1', text)
-
-        if new == text:
-            break
-
-        text = new
-
-    return text
-
-def unwrap_latex(text):
-
-    commands = [
-
-        "mathrm",
-        "mathbb",
-        "mathcal",
-        "mathbf",
-        "mathit",
-        "mathsf",
-        "mathtt",
-        "boldsymbol",
-        "bm",
-        "operatorname",
-        "text",
-
-    ]
-
-    for cmd in commands:
-
-        text = unwrap_command(text, cmd)
-
-    return text
-
-def normalize_accents(text):
-
-    accent_commands = [
-        "widehat",
-        "hat",
-        "widetilde",
-        "tilde",
-        "overline",
-        "underline",
-        "bar",
-        "vec",
-        "dot",
-        "ddot",
-        "acute",
-        "grave",
-        "breve",
-        "check",
-    ]
-
-    for cmd in accent_commands:
-        text = unwrap_command(text, cmd)
-
-    text = re.sub(
-        r'\\?(?:widehat|hat|widetilde|tilde|overline|underline|bar|vec|dot|ddot|acute|grave|breve|check)(?=[A-Za-zΑ-Ωα-ω])',
-        '',
-        text,
-    )
-
-    return text
-
-def normalize_operatorname(text):
-
-    text = unwrap_command(text, "operatorname")
-
-    text = re.sub(
-        r'\\?operatorname\*?',
-        '',
-        text,
-    )
-
-    keyword_map = {
-        r'\bl\s*i\s*m\b': 'lim',
-        r'\bs\s*u\s*p\b': 'sup',
-        r'\bi\s*n\s*f\b': 'inf',
-        r'\bm\s*i\s*n\b': 'min',
-        r'\bm\s*a\s*x\b': 'max',
-        r'\ba\s*r\s*g\b': 'arg',
-    }
-
-    for pattern, repl in keyword_map.items():
-        text = re.sub(pattern, repl, text)
-        
-    return text
-
-def normalize_arrows(text):
-
-    arrow_replacements = {
-        r'\\xrightarrow': '→',
-        r'\\xleftarrow': '←',
-        r'\\rightarrow': '→',
-        r'\\leftarrow': '←',
-        r'\\Rightarrow': '⇒',
-        r'\\Leftarrow': '⇐',
-        r'\\leftrightarrow': '↔',
-        r'\\Leftrightarrow': '⇔',
-        r'\\uparrow': '↑',
-        r'\\downarrow': '↓',
-    }
-
-    for old, new in arrow_replacements.items():
-        text = text.replace(old, new)
-
-    arrow_words = {
-        "xrightarrow": "→",
-        "xleftarrow": "←",
-        "rightarrow": "→",
-        "leftarrow": "←",
-        "Rightarrow": "⇒",
-        "Leftarrow": "⇐",
-        "leftrightarrow": "↔",
-        "Leftrightarrow": "⇔",
-        "uparrow": "↑",
-        "downarrow": "↓",
-    }
-
-    for old, new in arrow_words.items():
-        text = text.replace(old, new)
-
-    return text
-
-def normalize_floorceil(text):
-
-    floorceil = {
-        r'\\lfloor': '⌊',
-        r'\\rfloor': '⌋',
-        r'\\lceil': '⌈',
-        r'\\rceil': '⌉',
-    }
-
-    for old, new in floorceil.items():
-        text = text.replace(old, new)
-
-    floorceil_words = {
-        "lfloor": "⌊",
-        "rfloor": "⌋",
-        "lceil": "⌈",
-        "rceil": "⌉",
-    }
-
-    for old, new in floorceil_words.items():
-        text = text.replace(old, new)
-
-    return text
-
-def apply_replacements(text, rules):
-
-    for old, new in rules.items():
-        text = text.replace(old, new)
-
-    return text
-
-REPLACEMENT_RULES = {
-    r'\to': '→',
-    r'\rightarrow': '→',
-    r'\leftarrow': '←',
-    r'\mapsto': '↦',
-    r'\cong': '≅',
-    r'\in': '∈',
-    r'\notin': '∉',
-    r'\leq': '≤',
-    r'\geq': '≥',
-    r'\neq': '≠',
-    r'\times': '×',
-    r'\cdot': '·',
-    r'\pm': '±',
-
-    r'\int': '∫',
-    r'\prod': '∏',
-    r'\cup': '∪',
-    r'\cap': '∩',
-    r'\subseteq': '⊆',
-    r'\supseteq': '⊇',
-    r'\forall': '∀',
-    r'\exists': '∃',
-    r'\otimes': '⊗',
-    r'\oplus': '⊕',
-    r'\sim': '∼',
-    r'\approx': '≈',
-    r'\propto': '∝',
-    r'\iff': '⇔',
-    r'\implies': '⇒',
-    r'\Longrightarrow': '⇒',
-    r'\Longleftrightarrow': '⇔',
-    r'\equiv': '≡',
-    r'\subset': '⊂',
-    r'\supset': '⊃',
-    r'\emptyset': '∅',
-    r'\varnothing': '∅',
-    r'\infty': '∞',
-}
-
-GREEK_RULES = {
-    r'\chi': 'χ',
-    r'\xi': 'ξ',
-    r'\mu': 'μ',
-    r'\Lambda': 'Λ',
-    r'\Omega': 'Ω',
-    r'\Delta': 'Δ',
-    r'\Phi': 'Φ',
-    r'\Psi': 'Ψ',
-    r'\Gamma': 'Γ',
-    r'\pi': 'π',
-    r'\Pi': 'Π',
-    r'\sigma': 'σ',
-    r'\Sigma': 'Σ',
-    r'\phi': 'φ',
-    r'\Phi': 'Φ',
-    r'\omega': 'ω',
-    r'\Omega': 'Ω',
-    r'\lambda': 'λ',
-    r'\Lambda': 'Λ',
-    r'\alpha': 'α',
-    r'\beta': 'β',
-    r'\gamma': 'γ',
-    r'\delta': 'δ',
-    r'\epsilon': 'ε',
-    r'\varepsilon': 'ε',
-    r'\rho': 'ρ',
-    r'\tau': 'τ',
-    r'\zeta': 'ζ',
-    r'\eta': 'η',
-    r'\theta': 'θ',
-    r'\vartheta': 'ϑ',
-    r'\kappa': 'κ',
-    r'\nu': 'ν',
-    r'\upsilon': 'υ',
-    r'\psi': 'ψ',
-}
-
-def normalize_frac(text):
-
-    text = re.sub(
-        r'frac([0-9]+)([0-9]+)',
-        r'\1/\2',
-        text,
-    )
-
-    text = re.sub(
-        r'frac([A-Za-zα-ωΑ-Ω])([A-Za-zα-ωΑ-Ω])',
-        r'\1/\2',
-        text,
-    )
-
-    text = re.sub(
-        r'frac(∂)([A-Za-zα-ωΑ-Ω])',
-        r'\1/\2',
-        text,
-    )
-
-    text = re.sub(
-        r'frac(d)([A-Za-zα-ωΑ-Ω])',
-        r'\1/\2',
-        text,
-    )
-
-    return text
-
-def normalize_equation(text):
-
-    text = normalize_string(text)
-
-    text = preprocess_equation(text)
-
-    text = unwrap_latex(text)
-
-    text = normalize_accents(text)
-
-    text = normalize_operatorname(text)
-
-    text = normalize_arrows(text)
-
-    text = text.replace("backslash", "\\")
-
-
-    arrow_words = {
-        "xrightarrow": "→",
-        "xleftarrow": "←",
-        "rightarrow": "→",
-        "leftarrow": "←",
-        "Rightarrow": "⇒",
-        "Leftarrow": "⇐",
-        "leftrightarrow": "↔",
-        "Leftrightarrow": "⇔",
-        "uparrow": "↑",
-        "downarrow": "↓",
-    }
-
-    for old, new in arrow_words.items():
-        text = text.replace(old, new)
-
-    text = normalize_floorceil(text)
-
-    environment_words = [
-        "beginalign*",
-        "endalign*",
-        "beginalign",
-        "endalign",
-        "beginarray",
-        "endarray",
-        "beginmatrix",
-        "endmatrix",
-        "begincases",
-        "endcases",
-    ]
-
-    for word in environment_words:
-        text = text.replace(word, "")
-
-    text = text.replace("mathrmd", "d")
-    text = text.replace("\\mathrm{d}", "d")
-    text = text.replace("\\mathrm", "")
-
-    text = normalize_frac(text)
-    
-    text = apply_replacements(text, REPLACEMENT_RULES)
-
-    text = apply_replacements(text, GREEK_RULES)
-
-    text = re.sub(r'\bsum\b', '∑', text)
-    text = re.sub(r'\bpartial\b', '∂', text)
-    text = re.sub(r'\bnabla\b', '∇', text)
-    text = re.sub(r'\binfty\b', '∞', text)
-
-    text = re.sub(r'\bleft\b', '', text)
-    text = re.sub(r'\bright\b', '', text)
-
-    text = re.sub(r'\blangle\b', '⟨', text)
-    text = re.sub(r'\brangle\b', '⟩', text)
-
-    text = re.sub(r'\bprime\b', "′", text)
-    text = re.sub(r"\s+'\b", "'", text)
-
-    text = re.sub(r'\bmathbf\b', '', text)
-    text = re.sub(r'\s+', ' ', text)
-
-    
-    text = re.sub(r'xlongequal\s*\([^)]*\)', '', text)
-    text = re.sub(r'\bxlongequal\b', '=', text) 
-    
-    text = re.sub(
-        r'\\(?:big|Big|bigl|bigr|Bigl|Bigr|bigg|Bigg|biggl|biggr|Biggl|Biggr)\b',
-        '',
-        text,
-    )
-
-    text = re.sub(
-        r'\\(?:quad|qquad|,|;|!|:|enspace|thinspace|medspace|thickspace)\b',
-        '',
-        text,
-    )
-
-    text = re.sub(
-        r'\\(?:phantom|hphantom|vphantom)\{[^{}]*\}',
-        '',
-        text,
-    )
-
-
-    text = re.sub(r'\\displaystyle\b', '', text)
-
-    text = re.sub(r'\\ldots\b', '...', text)
-
-    text = re.sub(r'\s+', ' ', text).strip()
-
-    text = re.sub(r'\s+', ' ', text)
-
-    text = re.sub(r'_\{([^{}]+)\}', r'_\1', text)
-    text = re.sub(r'\^\{([^{}]+)\}', r'^\1', text)
-
-    text = re.sub(r'\{([^{}]+)\}', r'\1', text)
-
-    text = text.replace("\\", "")
-
-    text = re.sub(r'\s+', ' ', text)
-
-    
-    return text.strip()
-
-def merge_multiline_equations(equations):
-
-    if not equations:
-        return equations
-
-    merged = [equations[0]]
-
-    continuation_re = re.compile(
-        r"""^(
-            [+\-] |
-            [=] |
-            [)\]}] |
-            [&] |
-            ε|ζ|π|
-            o\(|O\(
-        )""",
-        re.X,
-    )
-
-    for eq in equations[1:]:
-
-        prev = merged[-1]
-
-        prev_pdf, prev_page, _, prev_text = prev
-        pdf, page, _, text = eq
-
-        if pdf != prev_pdf or page != prev_page:
-            merged.append(eq)
+            if looks_like_continuation and not has_marker:
+                current = (current + " " + text).strip()
+            else:
+                flush()
+                active_marker_multiplier = 1
+
+    flush()
+
+    # Professional membership/status affiliations.
+    out.extend(memberships)
+
+    # Existing conservative shared-affiliation rule:
+    # several authors + one unmarked affiliation => shared affiliation.
+    if (
+        len(author_names) > 1
+        and len(main_affiliations) == 1
+        and not saw_affiliation_marker
+    ):
+        shared = main_affiliations[0]
+
+        # One copy is already present.
+        out.extend([shared] * (len(author_names) - 1))
+
+    # ------------------------------------------------------------
+    # Footnote affiliations
+    # ------------------------------------------------------------
+    for b in blocks:
+        if b.get("block_label") != "footnote":
             continue
 
-        if continuation_re.match(text):
+        text = str(b.get("block_content", "")).strip()
 
-            merged[-1] = (
-                prev_pdf,
-                prev_page,
-                "equation",
-                prev_text + " " + text,
+        if not text or not cue.search(text):
+            continue
+
+        shared_count = 1
+
+        m_are_with = re.search(
+            r"\bare with\b",
+            text,
+            flags=re.I,
+        )
+
+        if m_are_with:
+            prefix = normalize_string(
+                text[:m_are_with.start()]
             )
 
-        else:
-            merged.append(eq)
+            matched_authors = 0
 
-    return merged
+            for author in author_names:
+                a = normalize_string(author)
 
-def extract_equation(pdf):
-    
-    pages = load_all_pages(pdf)
-       
-    if not pages:
-        return False, []
+                if a and a in prefix:
+                    matched_authors += 1
 
-    equations = []
+            if matched_authors > 1:
+                shared_count = matched_authors
 
-      
-    for page in pages:
+            text = text[m_are_with.end():].strip()
 
-        page_index = page["page_index"]
+        text = re.sub(
+            r";\s*(?:e-?mail|email)\s*:[^)]*(\))",
+            r"\1",
+            text,
+            flags=re.I,
+        )
 
-        for block in page.get("parsing_res_list", []):
+        text = re.sub(
+            r"[;(]\s*(?:e-?mail|email)\s*:.*$",
+            "",
+            text,
+            flags=re.I,
+        ).strip(" ,;.")
 
-            if block.get("block_label") != "display_formula":
-                continue
+        if text:
+            out.extend([text] * shared_count)
 
-            text = normalize_equation(
-                block.get("block_content", "")
-            )
-
-            if not text:
-                continue
-
-            equations.append(
-                (
-                    pdf.pdf_name,
-                    page_index,
-                    "equation",
-                    text,
-                )
-            )
-
-    equations = merge_multiline_equations(equations)
-
-    if not equations:
-        return False, []
-
-    return True, equations
+    return [x for x in out if x]
 
 
-_MONTHS = {
-    "jan": "January",
-    "feb": "February",
-    "mar": "March",
-    "apr": "April",
-    "may": "May",
-    "jun": "June",
-    "jul": "July",
-    "aug": "August",
-    "sep": "September",
-    "sept": "September",
-    "oct": "October",
-    "nov": "November",
-    "dec": "December",
-}
 
 
-def normalize_pub_date(text):
 
-    text = normalize_string(text).strip()
+def extract_author(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
 
-    m = re.search(
-        r"^\s*\(?\s*dated\s*:\s*"
-        r"(\d{1,2})\s+"
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)"
-        r"[a-z]*\.?\s+"
-        r"(\d{4})",
-        text,
+    if page.get("page_index") != 0:
+        return []
+
+    affiliation = re.compile(
+        r"\b(university|college|school|department|institute|institution|"
+        r"laboratory|laboratories|lab|centre|center|faculty|hospital|academy|"
+        r"research|physics|sciences?|group|cnrs|inria|cern|commissariat)\b",
+        re.I,
+    )
+    metadata = re.compile(
+        r"^\s*(preprint|received|accepted|published|publication|submitted|"
+        r"revised|online\s+version)\b",
+        re.I,
+    )
+    address = re.compile(
+        r"\b\d{3,}\b.*[,;]|\b(road|street|avenue|boulevard|france|"
+        r"united kingdom|usa|uk|china|switzerland)\b",
+        re.I,
+    )
+    marker = re.compile(r"\s*\$\s*\^\{[^}]+\}\s*\$\s*")
+    member = re.compile(
+        r",?\s*(?:senior\s+member|member|fellow)\s*,?\s*IEEE\b.*$",
         re.I,
     )
 
-    if m:
-        d, mon, y = m.groups()
-        return f"{int(d)} {_MONTHS[mon.lower()]} {y}"
+    out = []
+    seen_title = False
+
+    for b in page.get("parsing_res_list", []):
+        label = b.get("block_label")
+
+        if label == "doc_title":
+            seen_title = True
+            continue
+
+        if not seen_title:
+            continue
+
+        if label in {"abstract", "paragraph_title"}:
+            break
+        if label != "text":
+            continue
+
+        text = b.get("block_content", "").strip()
+        if not text:
+            continue
+
+        if "@" in text or metadata.search(text):
+            continue
+        if affiliation.search(text) or address.search(text):
+            continue
+
+        text = member.sub("", text)
+        text = marker.sub(" | ", text)
+        text = re.sub(r"\s+\band\b\s+", " | ", text, flags=re.I)
+
+        block_names = []
+        for name in text.split("|"):
+            name = re.sub(r"\s+", " ", name).strip(" ,;.")
+            if name:
+                block_names.append(name)
+
+        # Conservative OCR line-break merge:
+        # merge only an unfinished hyphen-ending author fragment with
+        # the first author candidate of the immediately following block.
+        if (
+            out
+            and block_names
+            and out[-1].endswith("-")
+        ):
+            out[-1] = out[-1][:-1].rstrip() + block_names[0].lstrip()
+            block_names = block_names[1:]
+
+        out.extend(block_names)
+
+    # Deduplicate authors using the benchmark's official normalization,
+    # while preserving the first raw prediction string.
+    from benchmark.normalisation import normalize_string
+
+    deduped = []
+    seen = set()
+    for name in out:
+        key = normalize_string(name)
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(normalize_string(name))
+
+    return deduped
+
+def extract_keyword(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    if page.get("page_index") != 0:
+        return []
+
+    from benchmark.normalisation import normalize_string
+
+    # Generic multilingual keyword headings.
+    heading = re.compile(
+        r"^\s*(?:"
+        r"key\s*words?"
+        r"|keywords?"
+        r"|index\s+terms?"
+        r"|mots?\s*[-‐-‒–—]?\s*cl[ée]s?"
+        r"|mots?\s*[-‐-‒–—]?\s*clefs?"
+        r"|palabras?\s+claves?"
+        r")\s*(?:[:.\-–—]\s*)?",
+        re.I,
+    )
+
+    # Generic publication/article metadata which must not become keywords.
+    metadata = re.compile(
+        r"(?:"
+        r"\bdoi\s*:?"
+        r"|\barxiv\s*:?"
+        r"|\bissn\b"
+        r"|\bisbn\b"
+        r"|\bvolume\b"
+        r"|\bvol\.\s*\d"
+        r"|\bissue\b"
+        r"|\breceived\b"
+        r"|\baccepted\b"
+        r"|\bpublished\b"
+        r"|\bpublication\b"
+        r"|\bpreprint\b"
+        r"|\bcopyright\b"
+        r"|\b©\b"
+        r"|https?://"
+        r"|www\."
+        r")",
+        re.I,
+    )
+
+    out = []
+    blocks = page.get("parsing_res_list", [])
+
+    def clean_item(item):
+        item = re.sub(r"\s+", " ", item).strip(" ,;:.|•·")
+        if not item:
+            return ""
+
+        # Canonicalize Unicode dash variants inside a keyword.
+        # ASCII hyphen is intentionally preserved.
+        item = re.sub(r"\s*[–—−]\s*", "−", item)
+        return normalize_string(item)
+
+    def split_keyword_line(line):
+        line = re.sub(r"\s+", " ", line).strip()
+        if not line:
+            return []
+
+        # Strong, language-independent list separators.
+        if re.search(r"[;,•·|]", line):
+            parts = re.split(r"\s*[;,•·|]\s*", line)
+
+        else:
+            # Dash is ambiguous: it may belong inside one keyword.
+            # Treat it as a list separator only when the line has
+            # several dash boundaries, i.e. clearly list-like.
+            dash_boundaries = re.findall(r"\s+[—–]\s+", line)
+            if len(dash_boundaries) >= 2:
+                parts = re.split(r"\s+[—–]\s+", line)
+            else:
+                parts = [line]
+
+        result = []
+        for part in parts:
+            item = clean_item(part)
+            if item:
+                result.append(item)
+        return result
+
+    for i, block in enumerate(blocks):
+        text = str(block.get("block_content", "") or "").strip()
+        if not text:
+            continue
+
+        m = heading.match(text)
+        if not m:
+            continue
+
+        remainder = text[m.end():].strip()
+
+        # ------------------------------------------------------------
+        # Form 1: heading and keyword list in the same block.
+        # ------------------------------------------------------------
+        if remainder:
+            for line in remainder.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if metadata.search(line):
+                    break
+                out.extend(split_keyword_line(line))
+            continue
+
+        # ------------------------------------------------------------
+        # Form 2: standalone heading followed by keyword text block(s).
+        # ------------------------------------------------------------
+        for next_block in blocks[i + 1:]:
+            label = next_block.get("block_label")
+            next_text = str(next_block.get("block_content", "") or "").strip()
+
+            if not next_text:
+                continue
+
+            # Structural end of the keyword zone.
+            if label in {
+                "paragraph_title",
+                "doc_title",
+                "abstract",
+                "reference_content",
+                "figure_title",
+                "table",
+            }:
+                break
+
+            if label != "text":
+                continue
+
+            consumed = False
+
+            for line in next_text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+
+                if metadata.search(line):
+                    return list(dict.fromkeys(out))
+
+                items = split_keyword_line(line)
+                if items:
+                    out.extend(items)
+                    consumed = True
+
+            # A standalone keyword heading normally owns the immediately
+            # following textual keyword region. Do not drift into body text.
+            if consumed:
+                break
+
+    # Normalize first, then deduplicate while preserving document order.
+    deduped = []
+    seen = set()
+
+    for item in out:
+        item = clean_item(item)
+        if item and item not in seen:
+            seen.add(item)
+            deduped.append(item)
+
+    return deduped
+
+
+
+def normalize_pub_date_text(text):
+    """
+    Generic normalization used only for publication-date recognition.
+
+    It does not decide whether a date is a publication date.
+    It only makes equivalent written date forms easier to recognize.
+    """
+    text = str(text or "")
+
+    # Unicode compatibility normalization:
+    # full-width digits/punctuation -> ordinary forms, etc.
+    text = unicodedata.normalize("NFKC", text)
+
+    # Unicode / non-breaking spaces.
+    for ch in (
+        "\u00a0", "\u2007", "\u2009", "\u200a",
+        "\u202f", "\u205f", "\u3000"
+    ):
+        text = text.replace(ch, " ")
+
+    # Unicode dash variants.
+    for ch in (
+        "\u2010", "\u2011", "\u2012", "\u2013",
+        "\u2014", "\u2212", "\ufe58", "\ufe63", "\uff0d"
+    ):
+        text = text.replace(ch, "-")
+
+    # Unicode punctuation variants commonly produced by OCR.
+    replacements = {
+        "／": "/",
+        "．": ".",
+        "，": ",",
+        "：": ":",
+        "﹕": ":",
+        "；": ";",
+        "（": "(",
+        "）": ")",
+        "［": "[",
+        "］": "]",
+    }
+
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    # Remove English ordinal suffixes:
+    # 1st, 2nd, 3rd, 4th ... -> 1, 2, 3, 4 ...
+    text = re.sub(
+        r"(?i)\b(\d{1,2})(?:st|nd|rd|th)\b",
+        r"\1",
+        text,
+    )
+
+    # Normalize common abbreviated month punctuation:
+    # Nov. -> Nov, Sept. -> Sept, etc.
+    text = re.sub(
+        r"(?i)\b("
+        r"jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec"
+        r")\.(?=\s|,|-|/|$)",
+        r"\1",
+        text,
+    )
+
+    # Normalize whitespace around date separators.
+    text = re.sub(r"\s*-\s*", "-", text)
+    text = re.sub(r"\s*/\s*", "/", text)
+    text = re.sub(r"\s*\.\s*(?=\d)", ".", text)
+
+    # Normalize comma spacing.
+    text = re.sub(r"\s*,\s*", ", ", text)
+
+    # Generic year-month-name-day form:
+    # 2016 November 23 -> 23 November 2016
+    month_name = (
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+        r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+        r"sep(?:t(?:ember)?|tember)?|"
+        r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+    )
 
     text = re.sub(
-        r"^(received|accepted|published|available online|online published|dated)\s*[:\-]?\s*",
-        "",
+        rf"\b((?:19|20)\d{{2}})\s+({month_name})\s+(\d{{1,2}})\b",
+        lambda m: f"{m.group(3)} {m.group(2)} {m.group(1)}",
         text,
         flags=re.I,
     )
 
+    # Collapse repeated whitespace last.
+    text = re.sub(r"\s+", " ", text).strip()
 
-    m = re.search(
-        r"\b(\d{4})-(\d{2})-(\d{2})\b",
-        text,
+    return text
+
+def extract_pub_date(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    if page.get("page_index") != 0:
+        return []
+
+    blocks = page.get("parsing_res_list", [])
+
+    MONTHS = {
+        "jan": 1, "january": 1,
+        "feb": 2, "february": 2,
+        "mar": 3, "march": 3,
+        "apr": 4, "april": 4,
+        "may": 5,
+        "jun": 6, "june": 6,
+        "jul": 7, "july": 7,
+        "aug": 8, "august": 8,
+        "sep": 9, "sept": 9, "september": 9,
+        "oct": 10, "october": 10,
+        "nov": 11, "november": 11,
+        "dec": 12, "december": 12,
+    }
+
+    MONTH_NAMES = {
+        1: "january", 2: "february", 3: "march", 4: "april",
+        5: "may", 6: "june", 7: "july", 8: "august",
+        9: "september", 10: "october", 11: "november", 12: "december",
+    }
+
+    month_rx = (
+        r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+        r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?|tember)?|"
+        r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
     )
 
-    if m:
-        y, mon, d = m.groups()
+    def norm(text):
+        text = str(text or "")
+
+        for ch in ("\u00a0", "\u2007", "\u2009", "\u202f"):
+            text = text.replace(ch, " ")
+
+        for ch in ("–", "—", "−", "‐", "‒"):
+            text = text.replace(ch, "-")
+
+        text = text.replace("，", ",")
+        text = text.replace("：", ":")
+        text = text.replace("／", "/")
+        text = text.replace("．", ".")
+
+        text = re.sub(
+            r"(?i)\b(jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\.",
+            r"\1",
+            text,
+        )
+
+        text = re.sub(
+            r"(?i)\b(\d{1,2})(?:st|nd|rd|th)\b",
+            r"\1",
+            text,
+        )
+
+        text = re.sub(r"\s+", " ", text)
+        return text.strip()
+
+    def emit(year, month, day):
         try:
-            dt = datetime.strptime(
-                f"{y}-{mon}-{d}",
-                "%Y-%m-%d",
-            )
-            return dt.strftime("%B %-d, %Y")
-        except ValueError:
-            pass
-
-
-    m = re.search(
-        r"(\d{1,2})\s+"
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?"
-        r"[a-z]*\s+"
-        r"(\d{4})",
-        text,
-        re.I,
-    )
-
-    if m:
-        d, mon, y = m.groups()
-        return f"{_MONTHS[mon.lower()]} {int(d)}, {y}"
-
-
-    m = re.search(
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|"
-        r"January|February|March|April|May|June|July|August|September|October|November|December)"
-        r"\.?\s+"
-        r"(\d{1,2}),?\s+"
-        r"(\d{4})",
-        text,
-        re.I,
-    )
-
-    if m:
-
-        mon, d, y = m.groups()
-
-        key = mon.lower().rstrip(".")
-
-        if key in _MONTHS:
-            mon = _MONTHS[key]
-        else:
-            mon = mon.capitalize()
-
-        return f"{mon} {int(d)}, {y}"
-
-
-    m = re.search(
-        r"(\d{1,2})\s+"
-        r"(January|February|March|April|May|June|July|August|September|October|November|December)"
-        r"\s+(\d{4})",
-        text,
-        re.I,
-    )
-
-    if m:
-        d, mon, y = m.groups()
-        return f"{mon.capitalize()} {int(d)}, {y}"
-
-
-    m = re.search(
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec|"
-        r"January|February|March|April|May|June|July|August|September|October|November|December)"
-        r"\.?\s+"
-        r"(\d{4})",
-        text,
-        re.I,
-    )
-
-    if m:
-
-        mon, y = m.groups()
-
-        key = mon.lower().rstrip(".")
-
-        if key in _MONTHS:
-            mon = _MONTHS[key]
-        else:
-            mon = mon.capitalize()
-
-        return f"{mon} {y}"
-
-    return None
-
-        
-
-def _pub_date_from_bibliographic_moddate(pdf, page):
-    try:
-        info = subprocess.run(
-            ["pdfinfo", pdf.filepath],
-            capture_output=True,
-            text=True,
-            check=False,
-        ).stdout
-
-        m = re.search(r"^ModDate:\s*(.+)$", info, re.M)
-        if not m:
+            year = int(year)
+            month = int(month)
+            day = int(day)
+        except Exception:
             return None
 
-        raw = re.sub(r"\s+", " ", m.group(1).strip())
-        raw = re.sub(r"\s+(?:EST|EDT)$", "", raw, flags=re.I)
+        if not 1900 <= year <= 2099 or not 1 <= month <= 12:
+            return None
 
-        dt = datetime.strptime(
-            raw,
-            "%a %b %d %H:%M:%S %Y",
-        )
-        year = str(dt.year)
+        days = {
+            1: 31, 2: 29, 3: 31, 4: 30,
+            5: 31, 6: 30, 7: 31, 8: 31,
+            9: 30, 10: 31, 11: 30, 12: 31,
+        }
 
-        bibliographic_hint = re.compile(
-            r"""(?ix)
-            (?:
-                \bvol(?:ume)?\.?\s*\d+
-                |
-                \b(?:no|n[oº°]|num[eé]ro|issue)\.?\s*\d+
-                |
-                \bpp?\.?\s*\d+
-                |
-                \bpages?\s*\d+
-                |
-                \b\d+\s*[-–—]\s*\d+\b
-            )
-            """
+        if not 1 <= day <= days[month]:
+            return None
+
+        return normalize_string(
+            f"{MONTH_NAMES[month]} {day}, {year}"
         )
 
-        for block in page.get("parsing_res_list", []):
-            label = str(block.get("block_label", "")).lower()
-            if label not in {"footer", "footnote"}:
-                continue
+    def extract_dates(text):
+        text = normalize_pub_date_text(norm(text))
+        found = []
 
-            txt = re.sub(
-                r"\s+",
-                " ",
-                str(block.get("block_content", "")),
-            )
+        # --------------------------------------------------------
+        # Generic scholarly date formats.
+        #
+        # Supported examples:
+        #   2016-11-23
+        #   2016/11/23
+        #   2016.11.23
+        #
+        #   23 November 2016
+        #   23 Nov 2016
+        #   23 Nov. 2016
+        #   23-Nov-2016
+        #   23/Nov/2016
+        #
+        #   November 23, 2016
+        #   Nov 23 2016
+        #   Nov. 23, 2016
+        #   Nov-23-2016
+        #   Nov/23/2016
+        # --------------------------------------------------------
 
-            if year in txt and bibliographic_hint.search(txt):
-                return dt.strftime("%Y-%m-%d")
+        # day month year
+        for m in re.finditer(
+            rf"\b(\d{{1,2}})\s*[-/. ]\s*"
+            rf"({month_rx})\.?"
+            rf"\s*[-/,. ]+\s*((?:19|20)\d{{2}})\b",
+            text,
+            re.I,
+        ):
+            day, month, year = m.groups()
 
-        return None
+            key = month.lower().rstrip(".")
+            month_num = MONTHS.get(key)
 
-    except (OSError, ValueError):
-        return None
+            if month_num:
+                d = emit(year, month_num, day)
+                if d:
+                    found.append(d)
 
+        # month day year
+        for m in re.finditer(
+            rf"\b({month_rx})\.?"
+            rf"\s*[-/. ]\s*(\d{{1,2}})"
+            rf"\s*(?:,|[-/. ])+\s*((?:19|20)\d{{2}})\b",
+            text,
+            re.I,
+        ):
+            month, day, year = m.groups()
 
-def extract_pub_date(pdf):
+            key = month.lower().rstrip(".")
+            month_num = MONTHS.get(key)
 
-    pages = load_all_pages(pdf)
+            if month_num:
+                d = emit(year, month_num, day)
+                if d:
+                    found.append(d)
 
-    if not pages:
-        return False, []
+        # ISO / year-month-day
+        for m in re.finditer(
+            r"\b((?:19|20)\d{2})\s*[-/.]\s*"
+            r"(\d{1,2})\s*[-/.]\s*(\d{1,2})\b",
+            text,
+        ):
+            year, month, day = m.groups()
 
-    page = pages[0]
-    blocks = page.get("parsing_res_list", [])
-    
-    PRIORITY = {
-        "published": 100,
-        "available": 90,
-        "accepted": 70,
-        "revised": 60,
-        "received": 50,
-        "submitted": 40,
-        "preprint": 30,
-        "arxiv": 20,
-        "generic": 0,
-    }
+            d = emit(year, month, day)
+            if d:
+                found.append(d)
 
-    candidates = []
+        # Purely numeric day/month/year or month/day/year.
+        # Accept only when the ordering is inherently unambiguous.
+        for m in re.finditer(
+            r"\b(\d{1,2})\s*[-/.]\s*"
+            r"(\d{1,2})\s*[-/.]\s*((?:19|20)\d{2})\b",
+            text,
+        ):
+            a, b, year = map(int, m.groups())
 
-    allowed = {
-        "header",
-        "text",
-        "footer",
-        "footnote",
-        "title",
-        "caption",
-    }
+            if a > 12 and 1 <= b <= 12:
+                # DD/MM/YYYY
+                d = emit(year, b, a)
 
-    for block in blocks:
+            elif b > 12 and 1 <= a <= 12:
+                # MM/DD/YYYY
+                d = emit(year, a, b)
 
-        label = block.get("block_label", "").lower()
+            else:
+                # Ambiguous numeric date such as 03/04/2016:
+                # do not guess.
+                d = None
 
-        if label not in allowed:
-            continue
+            if d:
+                found.append(d)
 
-        txt = normalize_string(block.get("block_content", ""))
-        txt = re.sub(r"\s+", " ", txt)
+        # Deduplicate after canonicalization.
+        out = []
+        seen = set()
 
-        if not txt:
-            continue
+        for d in found:
+            d = normalize_string(d)
 
-        txt = txt.replace("\r", "\n")
+            if d not in seen:
+                seen.add(d)
+                out.append(d)
 
-        txt = txt.replace("•", " ")
-        txt = txt.replace("|", " ")
-        txt = txt.replace("·", " ")
-        txt = re.sub(r"\s+", " ", txt)
+        return out
+
+    # Front matter only.
+    front = []
+
+    for i, b in enumerate(blocks):
+        label = b.get("block_label")
+        text = norm(b.get("block_content", ""))
+
+        if label == "abstract":
+            break
+
+        if label == "paragraph_title" and re.search(
+            r"\b(?:introduction|background|methods?|materials?|results?)\b",
+            text,
+            re.I,
+        ):
+            break
+
+        front.append((i, b, text))
+
+    if not front:
+        return []
+
+    strong_pub = re.compile(
+        r"\b(?:"
+        r"published\s+online|"
+        r"first\s+published|"
+        r"publication\s+date|"
+        r"date\s+of\s+publication|"
+        r"date\s+published|"
+        r"available\s+online|"
+        r"first\s+online|"
+        r"online\s+first|"
+        r"electronic(?:ally)?\s+published|"
+        r"version\s+of\s+record|"
+        r"published\s+ahead\s+of\s+print|"
+        r"ahead\s+of\s+print|"
+        r"epublished|"
+        r"epub"
+        r")\b",
+        re.I,
+    )
+
+    medium_pub = re.compile(
+        r"\b(?:"
+        r"published|"
+        r"publication|"
+        r"online\s+publication|"
+        r"online\s+version|"
+        r"preprint\s+online\s+version|"
+        r"posted\s+online|"
+        r"released\s+online|"
+        r"available\s+from|"
+        r"dated(?:\s*:)?"
+        r")\b",
+        re.I,
+    )
+
+    editorial = re.compile(
+        r"\b(?:"
+        r"received|submitted|accepted|revised|revision|"
+        r"resubmitted"
+        r")\b",
+        re.I,
+    )
+
+    version_workflow = re.compile(
+        r"\b(?:"
+        r"preprint|"
+        r"arxiv"
+        r")\b",
+        re.I,
+    )
+
+    repository_meta = re.compile(
+        r"\b(?:"
+        r"arxiv\s*:|"
+        r"biorxiv\s*:|"
+        r"medrxiv\s*:|"
+        r"preprint\b"
+        r")",
+        re.I,
+    )
+
+    # Independent evidence that this document carries a publication /
+    # public-availability date signal.
+    has_pub_signal = any(
+        (strong_pub.search(text) or medium_pub.search(text))
+        and not editorial.search(text)
+        for _, _, text in front
+    )
+
+    # ------------------------------------------------------------
+    # Priority 0:
+    # Segmented scholarly publication metadata.
+    #
+    # A publication-history block may contain several independent
+    # events, for example:
+    #
+    # Received DATE; Revised DATE; Accepted DATE; Published DATE
+    #
+    # Split those events first so editorial workflow dates do not
+    # cause the entire block to be rejected.
+    #
+    # Editorial/repository cues are segmentation boundaries only;
+    # they are never returned as publication dates here.
+    # ------------------------------------------------------------
+    publication_piece = re.compile(
+        r"\b(?:"
+        r"published(?:\s+online|\s+on)?|"
+        r"first\s+published|"
+        r"publication(?:\s+date)?|"
+        r"date\s+of\s+publication|"
+        r"date\s+published|"
+        r"available\s+online|"
+        r"online\s+publication|"
+        r"online\s+first|"
+        r"first\s+online|"
+        r"electronic(?:ally)?\s+published|"
+        r"published\s+ahead\s+of\s+print|"
+        r"version\s+of\s+record|"
+        r"posted\s+online|"
+        r"released\s+online|"
+        r"dated"
+        r")\b",
+        re.I,
+    )
+
+    workflow_piece = re.compile(
+        r"\b(?:"
+        r"received|accepted|revised|revision|submitted|resubmitted|"
+        r"preprint|arxiv|this\s+version"
+        r")\b",
+        re.I,
+    )
+
+    event_split_rx = re.compile(
+        r"""(?ix)
+        (?=
+            published\s+online |
+            first\s+published |
+            date\s+of\s+publication |
+            date\s+published |
+            publication\s+date |
+            available\s+online |
+            online\s+publication |
+            online\s+first |
+            first\s+online |
+            electronically\s+published |
+            electronic\s+published |
+            published\s+ahead\s+of\s+print |
+            version\s+of\s+record |
+            posted\s+online |
+            released\s+online |
+            published |
+            publication |
+            dated |
+            received |
+            accepted |
+            revised |
+            revision |
+            submitted |
+            resubmitted |
+            preprint |
+            this\s+version |
+            arxiv\s*:
+        )
+        """
+    )
+
+    for _, _, text in front:
+        cleaned = text.replace("\r", "\n")
+        cleaned = cleaned.replace("•", " ")
+        cleaned = cleaned.replace("|", " ")
+        cleaned = cleaned.replace("·", " ")
 
         pieces = []
 
-        for line in re.split(r"[;\n]", txt):
+        for line in re.split(r"[;\n]", cleaned):
             line = line.strip()
 
             if not line:
                 continue
 
-            line = line.strip(".,;:()[]{}")
+            line = line.strip(".,;:()[]{} ")
 
-            parts = re.split(
-                r"""(?ix)
-                (?=
-                    published|
-                    publication|
-                    accepted|
-                    received|
-                    revised|
-                    submitted|
-                    available\s+online|
-                    online|
-                    first\s+published|
-                    published\s+online|
-                    date\s+of\s+publication|
-                    preprint|
-                    this\s+version|
-                    dated:|
-                    arxiv:
-                )
-                """,
-                line,
-            )
+            for piece in event_split_rx.split(line):
+                piece = piece.strip(" .,;:()[]{}")
 
-            for p in parts:
-                p = p.strip()
-                if p:
-                    pieces.append(p)
+                if piece:
+                    pieces.append(piece)
 
         for piece in pieces:
-            piece = piece.strip()
-
-            if len(piece) > 120:
+            # Only explicit publication/public-availability events
+            # are candidates.
+            if not publication_piece.search(piece):
                 continue
 
-            piece = re.sub(r"\s+", " ", piece)
-
-            date = normalize_pub_date(piece)
-
-            if pdf.pdf_name == "topologicalAnalysisTruncated.pdf":
-                print("PIECE :", repr(piece))
-                print("DATE  :", date)
-
-            if not date:
+            # A workflow/repository-only fragment cannot become pub_date.
+            if workflow_piece.search(piece) and not publication_piece.search(piece):
                 continue
 
-            low = piece.lower()
-
-            score = PRIORITY["generic"]
-
-            if "published" in low:
-                score = PRIORITY["published"]
-
-            elif (
-                "available online" in low
-                or "published online" in low
-                or "first published" in low
-                or "date of publication" in low
-            ):
-                score = PRIORITY["available"]
-
-            elif "accepted" in low:
-                score = PRIORITY["accepted"]
-
-            elif "revised" in low:
-                score = PRIORITY["revised"]
-
-            elif "received" in low:
-                score = PRIORITY["received"]
-
-            elif "submitted" in low:
-                score = PRIORITY["submitted"]
-
-            elif "preprint" in low:
-                score = PRIORITY["preprint"]
-
-            elif low.startswith("arxiv"):
-                score = PRIORITY["arxiv"]
-
-            candidates.append(
-                {
-                    "score": score,
-                    "date": date,
-                    "page": page["page_index"],
-                    "text": piece,
-                }
-            )
-
-    if not candidates:
-        metadata_date = _pub_date_from_bibliographic_moddate(pdf, page)
-        if metadata_date:
-            return True, [
-                (
-                    pdf.pdf_name,
-                    page["page_index"],
-                    "pub_date",
-                    metadata_date,
-                )
-            ]
-        return False, []
-
-    candidates.sort(
-        key=lambda x: (
-            -x["score"],
-            len(x["text"]),
-        )
-    )
-
-    best = candidates[0]
-
-    if best["score"] < PRIORITY["available"]:
-        metadata_date = _pub_date_from_bibliographic_moddate(pdf, page)
-        if metadata_date:
-            return True, [
-                (
-                    pdf.pdf_name,
-                    page["page_index"],
-                    "pub_date",
-                    metadata_date,
-                )
-            ]
-
-    return True, [
-        (
-            pdf.pdf_name,
-            best["page"],
-            "pub_date",
-            best["date"],
-        )
-    ]
-
-
-
-
-ABSTRACT_HEADING_RE = re.compile(
-    r"(?ix)^\s*(?:"
-    r"résumé|resume|abstract|resumen"
-    r")\s*:?\s*$"
-)
-
-ABSTRACT_MULTI_HEADING_RE = re.compile(
-    r"(?ix)^\s*"
-    r"(?:résumé|resume|abstract|resumen)"
-    r"(?:\s*[-–—|/]\s*(?:résumé|resume|abstract|resumen))+"
-    r"\s*:?\s*$"
-)
-
-ABSTRACT_INLINE_RE = re.compile(
-    r"(?ix)^\s*"
-    r"(?:résumé|resume|abstract|resumen)"
-    r"\s*(?:[:.]|\s*[-–—•]\s*)+\s*"
-    r"(.+?)\s*$"
-)
-
-ABSTRACT_KEYWORD_RE = re.compile(
-    r"(?ix)^\s*(?:"
-    r"mots?\s*[- ]?\s*cl[ée]s?"
-    r"|keywords?"
-    r"|keys?\s+words?"
-    r"|palabras?\s+clave"
-    r")\b"
-)
-
-def extract_abstract(pdf):
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    results = []
-
-    region_active = False
-    parts = []
-    start_page = None
-
-    multi_region = False
-    multi_expected = 0
-    multi_emitted = 0
-
-    def emit_parts():
-        nonlocal parts, start_page, multi_emitted
-        nonlocal region_active, multi_region
-        nonlocal multi_expected
-
-        if parts:
-            merged = normalize_text(" ".join(parts))
-
-            if len(merged) >= 120:
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        start_page if start_page is not None else 0,
-                        "abstract",
-                        merged,
-                    )
-                )
-
-                if multi_region:
-                    multi_emitted += 1
-
-        parts = []
-        start_page = None
-
-        if (
-            multi_region
-            and multi_expected > 0
-            and multi_emitted >= multi_expected
-        ):
-            region_active = False
-            multi_region = False
-            multi_expected = 0
-            multi_emitted = 0
-
-    def close_region():
-        nonlocal region_active, multi_region
-        nonlocal multi_expected, multi_emitted
-
-        emit_parts()
-
-        region_active = False
-        multi_region = False
-        multi_expected = 0
-        multi_emitted = 0
-
-    def count_summary_markers(raw):
-        return len(
-            re.findall(
-                r"(?i)\b(?:résumé|resume|abstract|resumen)\b",
-                raw,
-            )
-        )
-
-    for page in pages:
-        page_index = page.get("page_index", 0)
-        blocks = _ordered_blocks(page)
-
-        for block in blocks:
-            label = block.get("block_label")
-            raw = str(block.get("block_content", "") or "").strip()
-
-            if not raw:
-                continue
-
-            clean = normalize_text(raw)
-
-            if region_active and label in {
-                "header",
-                "footer",
-                "number",
-                "aside_text",
-            }:
-                continue
-
-            is_multi_heading = bool(
-                ABSTRACT_MULTI_HEADING_RE.fullmatch(raw)
-            )
-
-            is_single_heading = bool(
-                ABSTRACT_HEADING_RE.fullmatch(raw)
-            )
-
-            if is_multi_heading or is_single_heading:
-                close_region()
-
-                region_active = True
-                start_page = page_index
-
-                if is_multi_heading:
-                    multi_region = True
-                    multi_expected = count_summary_markers(raw)
-                    multi_emitted = 0
-                else:
-                    multi_region = False
-                    multi_expected = 0
-                    multi_emitted = 0
-
-                continue
-
-            m = ABSTRACT_INLINE_RE.match(raw)
-
-            if m:
-                close_region()
-
-                body = normalize_text(m.group(1))
-
-                if len(body) >= 120:
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            page_index,
-                            "abstract",
-                            body,
-                        )
-                    )
-
-                continue
-
-            if not region_active:
-                continue
-
-            if ABSTRACT_KEYWORD_RE.match(raw):
-                if parts:
-                    emit_parts()
-
-                    if not multi_region:
-                        region_active = False
-
-                else:
-                    pass
-
-                continue
-
-            if label in {"paragraph_title", "doc_title"}:
-                if multi_region:
-                    if parts:
-                        emit_parts()
-
-                    if not region_active:
-                        continue
-
-                    continue
-
-                if parts:
-                    close_region()
-
-                continue
-
-            if label in {"text", "abstract"}:
-                if len(clean) < 120:
-                    continue
-
-                if start_page is None:
-                    start_page = page_index
-
-                parts.append(clean)
-
-                if multi_region and label == "abstract":
-                    emit_parts()
-
-                continue
-
-    close_region()
-
-    if not results and pages:
-        first_page = pages[0]
-        blocks = _ordered_blocks(first_page)[:15]
-
-        has_explicit_marker = False
-        has_doc_title = False
-        paragraph_title_count = 0
-        long_text_blocks = []
-
-        for block in blocks:
-            label = block.get("block_label")
-            raw = str(block.get("block_content", "") or "").strip()
-
-            if not raw:
-                continue
-
-            clean = normalize_text(raw)
-
-            if label == "doc_title":
-                has_doc_title = True
-
-            if label == "paragraph_title":
-                paragraph_title_count += 1
-
-            if (
-                ABSTRACT_HEADING_RE.fullmatch(raw)
-                or ABSTRACT_MULTI_HEADING_RE.fullmatch(raw)
-                or ABSTRACT_INLINE_RE.match(raw)
-            ):
-                has_explicit_marker = True
-
-            if label == "text" and len(clean) >= 300:
-                long_text_blocks.append(clean)
-
-        if (
-            has_doc_title
-            and not has_explicit_marker
-            and paragraph_title_count >= 1
-            and len(long_text_blocks) == 3
-        ):
-            for body in long_text_blocks:
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        first_page.get("page_index", 0),
-                        "abstract",
-                        body,
-                    )
-                )
-
-    if not results and len(pages) >= 2:
-        p0 = _ordered_blocks(pages[0])
-        p1 = _ordered_blocks(pages[1])
-
-        p0_abs = []
-        p0_long_text = []
-
-        for block in p0:
-            label = block.get("block_label")
-            raw = str(block.get("block_content", "") or "").strip()
-            if not raw:
-                continue
-
-            clean = normalize_text(raw)
-
-            if label == "abstract" and len(clean) >= 120:
-                p0_abs.append(clean)
-
-            if label == "text" and len(clean) >= 300:
-                p0_long_text.append(clean)
-
-        p1_meaningful = []
-        for block in p1:
-            label = block.get("block_label")
-
-            if label in {"header", "footer", "number", "aside_text"}:
-                continue
-
-            raw = str(block.get("block_content", "") or "").strip()
-            if not raw:
-                continue
-
-            p1_meaningful.append(
-                (label, normalize_text(raw))
-            )
-
-        p1_texts = [
-            text
-            for label, text in p1_meaningful
-            if label == "text" and len(text) >= 120
-        ]
-
-        page1_content_boundary = (
-            len(p1_meaningful) >= 3
-            and p1_meaningful[0][0] == "text"
-            and p1_meaningful[1][0] == "text"
-            and p1_meaningful[2][0] == "content"
-        )
-
-        page2_content_boundary = False
-
-        if len(pages) >= 3:
-            p2 = _ordered_blocks(pages[2])
-
-            for block in p2:
-                label = block.get("block_label")
-
-                if label in {"header", "footer", "number", "aside_text"}:
-                    continue
-
-                raw = str(block.get("block_content", "") or "").strip()
-                if not raw:
-                    continue
-
-                page2_content_boundary = (label == "content")
-                break
-
-        if (
-            len(p0_abs) == 1
-            and len(p1_texts) == 2
-            and (page1_content_boundary or page2_content_boundary)
-        ):
-            first_page_index = pages[0].get("page_index", 0)
-            second_page_index = pages[1].get("page_index", 1)
-
-            if p0_abs[0].rstrip().endswith((".", "!", "?", "»", "”")):
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        first_page_index,
-                        "abstract",
-                        p0_abs[0],
-                    )
-                )
-
-                for body in p1_texts:
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            second_page_index,
-                            "abstract",
-                            body,
-                        )
-                    )
-
-            elif len(p0_long_text) == 1:
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        first_page_index,
-                        "abstract",
-                        p0_long_text[0],
-                    )
-                )
-
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        first_page_index,
-                        "abstract",
-                        normalize_text(
-                            p0_abs[0] + " " + p1_texts[0]
-                        ),
-                    )
-                )
-
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        second_page_index,
-                        "abstract",
-                        p1_texts[1],
-                    )
-                )
-
-    if not results and pages:
-        page = pages[0]
-        blocks = _ordered_blocks(page)
-
-        abstract_indices = []
-        raw_abstracts = []
-
-        for i, block in enumerate(blocks):
-            if block.get("block_label") != "abstract":
-                continue
-
-            raw = normalize_text(
-                block.get("block_content", "")
-            )
-
-            if not raw:
-                continue
-
-            abstract_indices.append(i)
-            raw_abstracts.append(raw)
-
-        if raw_abstracts:
-            allow_raw_merge = True
-
-            last_index = abstract_indices[-1]
-
-            next_label = None
-            if last_index + 1 < len(blocks):
-                next_label = blocks[last_index + 1].get(
-                    "block_label"
-                )
-
-            merged = normalize_text(
-                " ".join(raw_abstracts)
-            )
-
-            if next_label == "footnote":
-                allow_raw_merge = bool(
-                    re.match(
-                        r"(?i)^\s*"
-                        r"(?:abstract|résumé|resume|resumen)"
-                        r"\b",
-                        merged,
-                    )
-                )
-
-            if allow_raw_merge and merged:
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        page.get("page_index", 0),
-                        "abstract",
-                        merged,
-                    )
-                )
-
-    if not results:
-        return False, []
-
-    deduped = []
-    seen = set()
-
-    for item in results:
-        key = (item[0], item[2], item[3])
-
-        if key in seen:
+            dates = extract_dates(piece)
+
+            if dates:
+                return [dates[0]]
+
+    # ------------------------------------------------------------
+    # Priority 1:
+    # Date directly associated with an explicit publication /
+    # public-availability statement.
+    #
+    # These semantic contexts outrank editorial workflow and
+    # repository/version dates.
+    # ------------------------------------------------------------
+    for _, _, text in front:
+        if editorial.search(text):
             continue
 
-        seen.add(key)
-        deduped.append(item)
+        if strong_pub.search(text):
+            dates = extract_dates(text)
+            if dates:
+                return [dates[0]]
 
-    return True, deduped
+    for _, _, text in front:
+        if editorial.search(text):
+            continue
 
-def extract_list(pdf):
+        if medium_pub.search(text) and not version_workflow.search(text):
+            dates = extract_dates(text)
+            if dates:
+                return [dates[0]]
 
-    pages = load_all_pages(pdf)
+    # ------------------------------------------------------------
+    # Priority 2:
+    # Repository/version dates (preprint/arXiv) are lower priority.
+    # They are considered only when an independent publication /
+    # availability signal exists and no higher-priority publication
+    # date was found above.
+    # ------------------------------------------------------------
+    if has_pub_signal:
+        for _, b, text in front:
+            if b.get("block_label") not in {"aside_text", "header", "text"}:
+                continue
 
-    if not pages:
-        return False, []
+            if not repository_meta.search(text):
+                continue
 
-    bullet_re = re.compile(
-        r"^\s*[•●▪◦*\-–—]\s+"
+            if editorial.search(text):
+                continue
+
+            dates = extract_dates(text)
+            if dates:
+                return [dates[0]]
+
+    # ------------------------------------------------------------
+    # Priority 3:
+    # Short metadata/date block immediately adjacent to a publication cue.
+    # ------------------------------------------------------------
+    for pos, (_, b, text) in enumerate(front):
+        if editorial.search(text):
+            continue
+
+        dates = extract_dates(text)
+
+        if not dates:
+            continue
+
+        if len(text) > 120:
+            continue
+
+        neighbors = []
+
+        if pos > 0:
+            neighbors.append(front[pos - 1][2])
+
+        if pos + 1 < len(front):
+            neighbors.append(front[pos + 1][2])
+
+        neighbor_text = " ".join(neighbors)
+
+        if editorial.search(neighbor_text):
+            continue
+
+        if strong_pub.search(neighbor_text) or medium_pub.search(neighbor_text):
+            return [dates[0]]
+
+    return []
+
+def extract_abstract(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    if page.get("page_index") != 0:
+        return []
+
+    out = []
+
+    for b in page.get("parsing_res_list", []):
+        if b.get("block_label") != "abstract":
+            continue
+
+        text = b.get("block_content", "").strip()
+        text = re.sub(r"^\s*abstract\s*[\-—–:.\s]+\s*", "", text, flags=re.I)
+
+        # Apply the official eSciBench normalization to the prediction.
+        text = normalize_string(text)
+
+        if text:
+            out.append(text)
+
+    return out
+
+def extract_caption(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    out = []
+
+    def canonicalize_caption_math(caption):
+        caption = normalize_string(caption)
+
+        # Remove inline LaTeX math delimiters while preserving content.
+        caption = re.sub(r"\$\s*(.*?)\s*\$", r"\1", caption)
+
+        # Canonicalize common mathematical symbols.
+        caption = caption.replace(r"\alpha", "α")
+        caption = caption.replace(r"\beta", "β")
+        caption = caption.replace(r"\chi", "χ")
+        caption = caption.replace(r"\delta", "δ")
+        caption = caption.replace(r"\Delta", "δ")
+        caption = caption.replace(r"\zeta", "ζ")
+        caption = caption.replace(r"\lambda", "λ")
+        caption = caption.replace(r"\omega", "ω")
+        caption = caption.replace(r"\varphi", "φ")
+        caption = caption.replace(r"\mu", "μ")
+        caption = caption.replace(r"\sigma", "σ")
+        caption = caption.replace(r"\times", "×")
+
+        # Convert simple LaTeX fractions to plain-text numerator/denominator.
+        caption = re.sub(
+            r"\\frac\s*\{([^{}]*)\}\s*\{([^{}]*)\}",
+            r"\1/\2",
+            caption,
+        )
+
+        # Remove purely typographical LaTeX wrappers.
+        caption = re.sub(r"\\mathrm\s*\{([^{}]*)\}", r"\1", caption)
+        caption = caption.replace(r"\left", "")
+        caption = caption.replace(r"\right", "")
+
+        # Normalize common LaTeX spacing commands.
+        caption = caption.replace(r"\,", "")
+        caption = caption.replace(r"\!", "")
+        caption = caption.replace(r"\;", " ")
+        caption = caption.replace(r"\:", " ")
+        caption = caption.replace("~", " ")
+
+        # Canonicalize generic mathematical commands.
+        caption = caption.replace(r"\log", "log")
+        caption = caption.replace(r"\to", "→")
+        caption = caption.replace(r"\in", "∈")
+        caption = caption.replace(r"\geq", "≥")
+        caption = caption.replace(r"\leq", "≤")
+        caption = caption.replace(r"\pm", "±")
+
+        # Flatten simple LaTeX superscript/subscript braces.
+        caption = re.sub(r"\^\{([^{}]+)\}", r"^\1", caption)
+        caption = re.sub(r"_\{([^{}]+)\}", r"_\1", caption)
+
+        # Normalize spacing around common operators.
+        caption = re.sub(r"\s*=\s*", "=", caption)
+        caption = re.sub(r"\s+", " ", caption).strip()
+
+        return caption
+
+    for b in page.get("parsing_res_list", []):
+        label = b.get("block_label", "")
+        text = " ".join(str(b.get("block_content", "")).split()).strip()
+
+        if not text:
+            continue
+
+        if label == "figure_title":
+            m = re.match(
+                r"^\s*(?:figure|fig\.?|table)\s*\d+[A-Za-z]?\s*[:.\-–—]?\s*(.+)$",
+                text,
+                re.I,
+            )
+            if not m:
+                continue
+
+            caption = m.group(1).strip()
+
+            # A real caption must contain descriptive text, not only a marker.
+            if not re.search(r"[A-Za-z]{2,}", caption):
+                continue
+
+            caption = canonicalize_caption_math(caption)
+
+            if caption:
+                out.append(caption)
+
+        elif label == "algorithm":
+            m = re.match(
+                r"^\s*algorithm\s*\d+[A-Za-z]?\s*[:.\-–—]?\s*(.+)$",
+                text,
+                re.I,
+            )
+            if not m:
+                continue
+
+            caption = m.group(1).strip()
+
+            # Paddle may merge the caption and algorithm steps into one block.
+            caption = re.split(r"\s+\d+\s*:\s+", caption, maxsplit=1)[0].strip()
+
+            if caption:
+                caption = canonicalize_caption_math(caption)
+
+                if caption:
+                    out.append(caption)
+
+    return out
+
+
+def extract_equation(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    out = []
+
+    for b in page.get("parsing_res_list", []):
+        if b.get("block_label") != "display_formula":
+            continue
+
+        text = " ".join(str(b.get("block_content", "")).split()).strip()
+        if not text:
+            continue
+
+        # Paddle commonly wraps display formulas in $$ ... $$.
+        if text.startswith("$$") and text.endswith("$$"):
+            text = text[2:-2].strip()
+
+        # Paddle OCR may letter-space textual math operators, e.g.
+        # \mathrm{t a n h}, \mathrm{P r}, \operatorname{M L P}.
+        # Collapse spacing only inside explicitly textual LaTeX commands.
+        def _collapse_textual_math_command(m):
+            command = m.group(1)
+            body = m.group(2)
+            return "\\" + command + "{" + re.sub(r"\s+", "", body) + "}"
+
+        text = re.sub(
+            r"\\(mathrm|operatorname)\{([A-Za-z](?:\s+[A-Za-z])+)\}",
+            _collapse_textual_math_command,
+            text,
+        )
+
+        # Convert LaTeX representation to plain text before official alignment.
+        text = LatexNodes2Text().latex_to_text(text)
+
+        # Apply the official eSciBench normalization on the prediction side.
+        text = normalize_string(text)
+
+        # Preserve sub/superscript structure produced from the Paddle LaTeX.
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if text:
+            out.append(text)
+
+    return out
+
+
+def extract_section(raw_json_path):
+    import re
+
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    out = []
+
+    for block in page.get("parsing_res_list", []):
+        if block.get("block_label") != "paragraph_title":
+            continue
+
+        text = str(block.get("block_content", "")).strip()
+        if not text:
+            continue
+
+        text = normalize_string(text)
+
+        # Remove generic section-number prefixes while preserving
+        # the actual heading text.
+        #
+        # Examples:
+        #   "3.1. model"      -> "model"
+        #   "2 introduction"  -> "introduction"
+        #   "iv. discussion"  -> "discussion"
+        #   "a. background"   -> "background"
+        text = re.sub(
+            r"^\s*(?:"
+            r"\d+(?:\.\d+)*\.?"
+            r"|[ivxlcdm]+\."
+            r"|[a-z]\."
+            r")\s+",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        if not text:
+            continue
+
+        # Number-parenthesis items ending in a colon are typically
+        # enumerated prose/subpoints rather than document section headings.
+        # Example structural form: "2) transitivity:"
+        if re.match(r"^\d+\)\s+.+:\s*$", text):
+            continue
+
+        # paragraph_title can also contain structural elements that are
+        # not document sections. Keep these filters generic and semantic.
+        if re.match(r"^theorem\b", text, flags=re.IGNORECASE):
+            continue
+
+        if re.match(r"^returns?\s*:\s*$", text, flags=re.IGNORECASE):
+            continue
+
+        if re.match(r"^keywords?\s*:?\s*$", text, flags=re.IGNORECASE):
+            continue
+
+        if re.match(r"^contents?\s*:?\s*$", text, flags=re.IGNORECASE):
+            continue
+
+        out.append(text)
+
+    return out
+
+
+def extract_reference(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    refs = []
+
+    for block in page.get("parsing_res_list", []):
+        if block.get("block_label") != "reference_content":
+            continue
+
+        text = str(block.get("block_content", "")).strip()
+        if not text:
+            continue
+
+        text = normalize_string(text)
+
+        if text:
+            refs.append(text)
+
+    # Remove only strict duplicate fragments:
+    # if one normalized reference block is wholly contained inside
+    # a longer reference block on the same page, keep the longer one.
+    out = []
+
+    for i, text in enumerate(refs):
+        contained = False
+
+        for j, other in enumerate(refs):
+            if i == j:
+                continue
+
+            if len(text) < len(other) and text in other:
+                contained = True
+                break
+
+        if not contained:
+            out.append(text)
+
+    return out
+
+
+def extract_header(raw_json_path):
+    import re
+    from pathlib import Path
+
+    raw_json_path = Path(raw_json_path)
+
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    page_index = page.get("page_index")
+    page_height = page.get("height")
+    blocks = page.get("parsing_res_list", [])
+    out = []
+
+    def clean_text(value):
+        value = str(value or "").strip()
+        if not value:
+            return ""
+        return normalize_string(value)
+
+    def is_copyright(text):
+        return bool(
+            re.match(r"^\s*(?:©|copyright\b)", text, flags=re.IGNORECASE)
+        )
+
+    def is_top_region(block, height):
+        if not height:
+            return False
+
+        bbox = block.get(
+            "block_bbox",
+            block.get("bbox", block.get("coordinate"))
+        )
+
+        if not isinstance(bbox, (list, tuple)) or len(bbox) < 4:
+            return False
+
+        try:
+            return float(bbox[3]) <= 0.15 * float(height)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return False
+
+    # Page 0: preserve Paddle's explicit document/journal headers.
+    if page_index == 0:
+        for block in blocks:
+            if block.get("block_label") != "header":
+                continue
+
+            text = clean_text(block.get("block_content", ""))
+
+            if not text or is_copyright(text):
+                continue
+
+            if text not in out:
+                out.append(text)
+
+        return out
+
+    # Establish trusted running-header strings from Paddle's explicit
+    # header detections across the same scholarly document.
+    occurrences = {}
+
+    for sibling in raw_json_path.parent.glob("*_res.json"):
+        try:
+            with open(sibling, "r", encoding="utf-8") as f:
+                sibling_page = json.load(f)
+        except Exception:
+            continue
+
+        sibling_index = sibling_page.get("page_index")
+
+        for block in sibling_page.get("parsing_res_list", []):
+            if block.get("block_label") != "header":
+                continue
+
+            text = clean_text(block.get("block_content", ""))
+
+            if not text or is_copyright(text):
+                continue
+
+            occurrences.setdefault(text, set()).add(sibling_index)
+
+    repeated = {
+        text for text, pages in occurrences.items()
+        if len(pages) >= 2
+    }
+
+    # Normal Paddle header detections.
+    for block in blocks:
+        if block.get("block_label") != "header":
+            continue
+
+        text = clean_text(block.get("block_content", ""))
+
+        if text and text in repeated and text not in out:
+            out.append(text)
+
+    # Conservative layout-label rescue:
+    # a non-header block may be recovered only when
+    #   1. it lies in the top 15% of the page, and
+    #   2. its normalized text EXACTLY matches a running-header string
+    #      independently confirmed as "header" on >=2 other pages.
+    for block in blocks:
+        if block.get("block_label") == "header":
+            continue
+
+        if not is_top_region(block, page_height):
+            continue
+
+        text = clean_text(block.get("block_content", ""))
+
+        if text and text in repeated and text not in out:
+            out.append(text)
+
+    return out
+
+
+def extract_footer(raw_json_path):
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    blocks = page.get("parsing_res_list", [])
+    out = []
+
+    # Generic scholarly-footnote markers.  These markers identify
+    # footnotes but are not part of the semantic footer content.
+    marker_re = re.compile(
+        r"""
+        ^\s*
+        (?:
+            \$\s*\^?\s*\{\s*(?:\d{1,3}|[*†‡])\s*\}\s*\$
+            |
+            [*†‡]\s*
+            |
+            \(\s*\d{1,3}\s*\)\s+
+            |
+            \d{1,3}[.)]\s+
+        )
+        """,
+        flags=re.VERBOSE,
+    )
+
+    def has_leading_marker(value):
+        value = str(value or "")
+        return bool(marker_re.match(value))
+
+    def clean_footnote_text(value):
+        value = str(value or "").strip()
+        if not value:
+            return ""
+
+        # Remove only a marker occurring at the beginning of the
+        # footnote. Numbers/symbols inside the actual text are preserved.
+        value = marker_re.sub("", value, count=1).strip()
+
+        return value
+
+    def clean_formula(value):
+        value = str(value or "").strip()
+        if not value:
+            return ""
+
+        value = LatexNodes2Text().latex_to_text(value)
+        value = re.sub(r"[_^]+", " ", value)
+        value = re.sub(r"\s+", " ", value).strip()
+
+        return value
+
+    i = 0
+
+    while i < len(blocks):
+        block = blocks[i]
+
+        if block.get("block_label") != "footnote":
+            i += 1
+            continue
+
+        first = clean_footnote_text(block.get("block_content", ""))
+
+        text_parts = []
+        if first:
+            text_parts.append(first)
+
+        j = i + 1
+
+        # Reconstruct a logical scholarly footnote across layout blocks.
+        #
+        # Continuations without a new marker belong to the current
+        # footnote.  A later footnote carrying a fresh marker starts a
+        # new independent footer and is therefore left for the next
+        # outer iteration.
+        while j < len(blocks):
+            next_block = blocks[j]
+            label = next_block.get("block_label")
+
+            if label == "display_formula":
+                value = clean_formula(next_block.get("block_content", ""))
+                if value:
+                    text_parts.append(value)
+                j += 1
+                continue
+
+            if label == "formula_number":
+                # Equation numbers are layout metadata, not semantic
+                # footer text.
+                j += 1
+                continue
+
+            if label == "footnote":
+                raw_value = str(
+                    next_block.get("block_content", "") or ""
+                ).strip()
+
+                if has_leading_marker(raw_value):
+                    # New explicitly marked footnote: do not merge.
+                    break
+
+                value = clean_footnote_text(raw_value)
+                if value:
+                    text_parts.append(value)
+
+                j += 1
+                continue
+
+            break
+
+        text = " ".join(x for x in text_parts if x)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if not text:
+            i = j if j > i else i + 1
+            continue
+
+        # Final normalization uses the official eSciBench normalizer.
+        text = normalize_string(text)
+
+        if not text:
+            i = j if j > i else i + 1
+            continue
+
+        low = text.lower()
+
+        # Keep the existing conservative exclusion for a structure that
+        # is clearly an author/contact/affiliation note rather than the
+        # Footer target used by this wrapper.
+        if (
+            "are with" in low
+            and "email:" in low
+            and "phone:" in low
+        ):
+            i = j if j > i else i + 1
+            continue
+
+        out.append(text)
+
+        i = j if j > i else i + 1
+
+    return out
+
+
+def extract_table(raw_json_path):
+    import re
+    import html
+
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    out = []
+
+    for block in page.get("parsing_res_list", []):
+        if block.get("block_label") != "table":
+            continue
+
+        table_html = str(block.get("block_content", "")).strip()
+        if not table_html:
+            continue
+
+        # A single PaddleOCR table block represents one table.
+        # Merge all non-empty cells from that table into one text value.
+        cells = re.findall(
+            r"<(?:td|th)\b[^>]*>(.*?)</(?:td|th)>",
+            table_html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        merged = []
+
+        for cell in cells:
+            cell = html.unescape(cell)
+
+            # Convert explicit HTML line breaks to spaces before stripping tags.
+            cell = re.sub(r"<br\s*/?>", " ", cell, flags=re.IGNORECASE)
+
+            # Flatten any remaining nested markup inside the cell.
+            cell = re.sub(r"<[^>]+>", " ", cell)
+
+            # Normalize layout whitespace before official text normalization.
+            cell = re.sub(r"\s+", " ", cell).strip()
+
+            if not cell:
+                continue
+
+            cell = normalize_string(cell)
+
+            # Generic table-specific math canonicalization.
+            # Preserve semantic content while reducing superficial LaTeX
+            # representation differences inside table cells.
+            cell = re.sub(r"\$\s*(.*?)\s*\$", r"\1", cell)
+            cell = cell.replace(r"\alpha", "α")
+            cell = cell.replace(r"\tau", "τ")
+            cell = cell.replace(r"\times", "×")
+
+            # Flatten simple LaTeX superscript/subscript braces.
+            cell = re.sub(r"\^\{([^{}]+)\}", r"^\1", cell)
+            cell = re.sub(r"_\{([^{}]+)\}", r"_\1", cell)
+
+            # Remove spacing around common mathematical operators/ranges.
+            cell = re.sub(r"\s*=\s*", "=", cell)
+            cell = re.sub(r"(?<=\d)\s*-\s*(?=\d)", "-", cell)
+
+            # Final whitespace cleanup after canonicalization.
+            cell = re.sub(r"\s+", " ", cell).strip()
+
+            if cell:
+                merged.append(cell)
+
+        # Generic fallback: if PaddleOCR labels the block as a table but
+        # no td/th cells are recoverable, flatten the whole table markup.
+        if not merged:
+            fallback = html.unescape(table_html)
+            fallback = re.sub(r"<br\s*/?>", " ", fallback, flags=re.IGNORECASE)
+            fallback = re.sub(r"<[^>]+>", " ", fallback)
+            fallback = re.sub(r"\s+", " ", fallback).strip()
+            fallback = normalize_string(fallback)
+
+            if fallback:
+                merged.append(fallback)
+
+        # Tables whose non-empty cells consist only of binary digits
+        # are treated as non-table structural content.
+        # Keep this generic: it depends only on cell content.
+        nonempty = [x for x in merged if x.strip()]
+
+        if nonempty:
+            binary_only = all(
+                re.fullmatch(r"[01]+", x.replace(" ", ""))
+                for x in nonempty
+            )
+
+            if binary_only:
+                continue
+
+            out.append(" ".join(nonempty))
+
+    return out
+
+def extract_list(raw_json_path):
+    """
+    Extract individual scholarly list items from PaddleOCR-VL output.
+
+    Generic structural policy:
+    - each detected list item is returned independently;
+    - numbered enumerations are excluded because numbering alone is
+      ambiguous with definitions, properties, proofs and algorithmic steps;
+    - strong typographic bullets may occur as separate OCR blocks or as
+      several lines inside one OCR block;
+    - weak dash-like bullets are accepted only as separate block anchors;
+    - separate-block items must form a compact, aligned local sequence;
+    - unmarked blocks may be merged only as continuations between confirmed
+      anchors;
+    - item reconstruction is LaTeX-aware before the official benchmark
+      normalize_string() is applied.
+    """
+    with open(raw_json_path, "r", encoding="utf-8") as f:
+        page = json.load(f)
+
+    blocks = page.get("parsing_res_list", [])
+
+    strong_chars = "•●▪◦‣"
+    weak_chars = "*-–—"
+
+    strong_line_re = re.compile(
+        rf"(?m)^\s*([{re.escape(strong_chars)}])\s+(.+?)"
+        rf"(?=^\s*[{re.escape(strong_chars)}]\s+|\Z)",
+        re.DOTALL,
+    )
+
+    strong_start_re = re.compile(
+        rf"^\s*([{re.escape(strong_chars)}])\s+(.+)$",
+        re.DOTALL,
+    )
+
+    weak_start_re = re.compile(
+        rf"^\s*([{re.escape(weak_chars)}])\s+(.+)$",
+        re.DOTALL,
+    )
+
+    any_anchor_re = re.compile(
+        rf"^\s*([{re.escape(strong_chars + weak_chars)}])\s+(.+)$",
+        re.DOTALL,
     )
 
     numbered_re = re.compile(
-        r"^\s*(\d{1,2})\s*[\.\)]\s+"
+        r"^\s*(?:\(?\d{1,3}\)?[.)])\s+\S",
+        re.DOTALL,
     )
 
-    results = []
+    def bbox(block):
+        b = block.get("block_bbox")
+        if not isinstance(b, (list, tuple)) or len(b) < 4:
+            return None
+        try:
+            return tuple(float(x) for x in b[:4])
+        except Exception:
+            return None
 
-    for page in pages:
-        page_index = page.get("page_index", 0)
-        blocks = page.get("parsing_res_list", [])
+    def latex_reconstruct(text):
+        """
+        Conservative reconstruction for text originating from scientific
+        LaTeX.  Preserve mathematical content while reducing OCR/LaTeX
+        representation differences before official normalization.
+        """
+        text = str(text or "").strip()
+        if not text:
+            return ""
 
-        texts = []
+        # PDF/OCR line wrapping is not an item boundary.
+        text = re.sub(r"\s*\n\s*", " ", text)
 
-        for block_index, block in enumerate(blocks):
-            if block.get("block_label") != "text":
-                continue
+        # Common escaped LaTeX textual characters.
+        text = (
+            text.replace(r"\&", "&")
+                .replace(r"\%", "%")
+                .replace(r"\#", "#")
+                .replace(r"\_", "_")
+                .replace(r"\{", "{")
+                .replace(r"\}", "}")
+        )
 
-            text = normalize_text(
-                block.get("block_content", "")
-            )
+        # Convert LaTeX to readable text when pylatexenc is available.
+        # If conversion fails, preserve the original reconstructed string.
+        try:
+            from pylatexenc.latex2text import LatexNodes2Text
+            converted = LatexNodes2Text().latex_to_text(text)
+            if converted and converted.strip():
+                text = converted
+        except Exception:
+            pass
 
-            if text:
-                texts.append(
-                    (block_index, text)
-                )
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
 
-        i = 0
+    def finalise(text):
+        text = latex_reconstruct(text)
+        if not text:
+            return ""
+        return normalize_string(text)
 
-        while i < len(texts):
-            block_index, text = texts[i]
+    def aligned(a, b):
+        ba = bbox(a)
+        bb = bbox(b)
+        if ba is None or bb is None:
+            return False
 
-            if not bullet_re.match(text):
-                i += 1
-                continue
+        ax1, ay1, ax2, ay2 = ba
+        bx1, by1, bx2, by2 = bb
 
-            items = [[block_index, text]]
-            marker_count = 1
-            last_physical_index = block_index
+        aw = max(1.0, ax2 - ax1)
+        bw = max(1.0, bx2 - bx1)
+        ah = max(1.0, ay2 - ay1)
 
-            j = i + 1
+        # Same local column / indentation.
+        if abs(ax1 - bx1) > 25:
+            return False
 
-            while j < len(texts):
-                next_index, next_text = texts[j]
+        # Avoid crossing strongly different column widths.
+        if abs(ax2 - bx2) > max(120.0, 0.35 * max(aw, bw)):
+            return False
 
-                if next_index != last_physical_index + 1:
-                    break
+        # Physical reading direction.
+        if by1 < ay1 - 5:
+            return False
 
-                if bullet_re.match(next_text):
-                    items.append(
-                        [next_index, next_text]
-                    )
-                    marker_count += 1
-                    last_physical_index = next_index
-                    j += 1
-                    continue
+        gap = by1 - ay2
 
-                if numbered_re.match(next_text):
-                    break
+        # Compact scholarly-list spacing.
+        if gap > max(65.0, 2.5 * ah):
+            return False
 
-                continuation = []
-                k = j
-                previous_index = last_physical_index
+        return True
 
-                while k < len(texts):
-                    candidate_index, candidate_text = texts[k]
+    def continuation_compatible(anchor, continuation):
+        ba = bbox(anchor)
+        bc = bbox(continuation)
 
-                    if candidate_index != previous_index + 1:
-                        break
+        if ba is None or bc is None:
+            return False
 
-                    if (
-                        bullet_re.match(candidate_text)
-                        or numbered_re.match(candidate_text)
-                    ):
-                        break
+        ax1, ay1, ax2, ay2 = ba
+        cx1, cy1, cx2, cy2 = bc
 
-                    continuation.append(
-                        (candidate_index, candidate_text)
-                    )
-                    previous_index = candidate_index
-                    k += 1
+        ah = max(1.0, ay2 - ay1)
 
-                if (
-                    k < len(texts)
-                    and texts[k][0] == previous_index + 1
-                    and bullet_re.match(texts[k][1])
-                ):
-                    if continuation:
-                        items[-1][1] = normalize_text(
-                            " ".join(
-                                [items[-1][1]]
-                                + [
-                                    continuation_text
-                                    for _, continuation_text
-                                    in continuation
-                                ]
-                            )
-                        )
+        # A continuation should not jump substantially to the left of
+        # the item's anchor and must remain in the same local column.
+        if cx1 < ax1 - 20:
+            return False
 
-                        last_physical_index = continuation[-1][0]
+        if cx1 > ax2:
+            return False
 
-                    next_marker_index, next_marker_text = texts[k]
+        if cy1 < ay1 - 5:
+            return False
 
-                    items.append(
-                        [
-                            next_marker_index,
-                            next_marker_text,
-                        ]
-                    )
+        if cy1 - ay2 > max(80.0, 3.0 * ah):
+            return False
 
-                    marker_count += 1
-                    last_physical_index = next_marker_index
-                    j = k + 1
-                    continue
+        return True
 
+    def block_text(block):
+        return str(block.get("block_content", "") or "").strip()
+
+    out = []
+
+    # ---------------------------------------------------------------
+    # Route A: several STRONG bullet items merged by OCR into one block.
+    # Weak '-'/'*'/dash markers are deliberately excluded here because
+    # scientific prose and mathematical case distinctions commonly use
+    # them inside a single text block.
+    # ---------------------------------------------------------------
+    for block in blocks:
+        if block.get("block_label") != "text":
+            continue
+
+        text = block_text(block)
+        if not text:
+            continue
+
+        matches = list(strong_line_re.finditer(text))
+
+        if len(matches) < 2:
+            continue
+
+        markers = [m.group(1) for m in matches]
+
+        # A coherent bullet run uses one typographic bullet family.
+        if len(set(markers)) != 1:
+            continue
+
+        for match in matches:
+            item = finalise(match.group(2))
+            if item:
+                out.append(item)
+
+    # ---------------------------------------------------------------
+    # Route B: list items represented as separate OCR text blocks.
+    #
+    # Strong and weak bullets are permitted here, but a run requires at
+    # least two confirmed anchors with the SAME marker and compatible
+    # local geometry.  Continuation blocks are retained only when they
+    # lie between two confirmed anchors.
+    # ---------------------------------------------------------------
+    i = 0
+
+    while i < len(blocks):
+        first = blocks[i]
+
+        if first.get("block_label") != "text":
+            i += 1
+            continue
+
+        first_text = block_text(first)
+        m0 = any_anchor_re.match(first_text)
+
+        if not m0:
+            i += 1
+            continue
+
+        marker = m0.group(1)
+
+        # Never reinterpret numeric scholarly enumerations through this
+        # route.
+        if numbered_re.match(first_text):
+            i += 1
+            continue
+
+        anchors = [(i, first, m0.group(2))]
+        pending = []
+
+        j = i + 1
+
+        while j < len(blocks):
+            cur = blocks[j]
+
+            # A non-text layout object ends the local list run.
+            if cur.get("block_label") != "text":
                 break
 
-            if marker_count >= 2:
-                merged = normalize_text(
-                    " ".join(
-                        item_text
-                        for _, item_text in items
-                    )
-                )
+            text = block_text(cur)
+            if not text:
+                break
 
-                if merged:
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            page_index,
-                            "list",
-                            merged,
-                        )
-                    )
+            # Explicit numbered structures are a boundary, not a bullet
+            # continuation.
+            if numbered_re.match(text):
+                break
 
-            i = max(j, i + 1)
+            ma = any_anchor_re.match(text)
 
-        i = 0
-
-        while i < len(texts):
-            block_index, text = texts[i]
-            match = numbered_re.match(text)
-
-            if (
-                not match
-                or int(match.group(1)) != 1
-            ):
-                i += 1
-                continue
-
-            items = [[block_index, text]]
-            marker_count = 1
-            expected = 2
-            last_physical_index = block_index
-            j = i + 1
-
-            while j < len(texts):
-                next_index, next_text = texts[j]
-
-                if next_index != last_physical_index + 1:
+            if ma:
+                # Different marker => different structure/run.
+                if ma.group(1) != marker:
                     break
 
-                next_match = numbered_re.match(
-                    next_text
-                )
+                prev_anchor = anchors[-1][1]
 
-                if (
-                    next_match
-                    and int(next_match.group(1)) == expected
-                ):
-                    items.append(
-                        [next_index, next_text]
-                    )
-
-                    marker_count += 1
-                    expected += 1
-                    last_physical_index = next_index
-                    j += 1
-                    continue
-
-                if (
-                    bullet_re.match(next_text)
-                    or next_match
-                ):
+                if not aligned(prev_anchor, cur):
                     break
 
-                continuation = []
-                k = j
-                previous_index = last_physical_index
-
-                while k < len(texts):
-                    candidate_index, candidate_text = texts[k]
-
-                    if candidate_index != previous_index + 1:
-                        break
-
-                    candidate_match = numbered_re.match(
-                        candidate_text
-                    )
-
-                    if (
-                        bullet_re.match(candidate_text)
-                        or candidate_match
-                    ):
-                        break
-
-                    continuation.append(
-                        (
-                            candidate_index,
-                            candidate_text,
-                        )
-                    )
-
-                    previous_index = candidate_index
-                    k += 1
-
-                if k >= len(texts):
-                    break
-
-                candidate_index, candidate_text = texts[k]
-
-                if candidate_index != previous_index + 1:
-                    break
-
-                candidate_match = numbered_re.match(
-                    candidate_text
-                )
-
-                if (
-                    not candidate_match
-                    or int(candidate_match.group(1))
-                    != expected
-                ):
-                    break
-
-                if continuation:
-                    items[-1][1] = normalize_text(
-                        " ".join(
-                            [items[-1][1]]
-                            + [
-                                continuation_text
-                                for _, continuation_text
-                                in continuation
-                            ]
-                        )
-                    )
-
-                    last_physical_index = continuation[-1][0]
-
-                items.append(
-                    [
-                        candidate_index,
-                        candidate_text,
-                    ]
-                )
-
-                marker_count += 1
-                expected += 1
-                last_physical_index = candidate_index
-                j = k + 1
-
-            if marker_count >= 2:
-                merged = normalize_text(
-                    " ".join(
-                        item_text
-                        for _, item_text in items
-                    )
-                )
-
-                if merged:
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            page_index,
-                            "list",
-                            merged,
-                        )
-                    )
-
-            i = max(j, i + 1)
-
-
-    for page in pages:
-        page_index = page.get("page_index", 0)
-        blocks = page.get("parsing_res_list", [])
-
-        for intro_i, intro_block in enumerate(blocks):
-            if intro_block.get("block_label") not in {
-                "text",
-                "doc_title",
-            }:
-                continue
-
-            intro = normalize_text(
-                intro_block.get("block_content", "")
-            )
-
-            if not intro or not intro.endswith(":"):
-                continue
-
-            run = []
-            j = intro_i + 1
-
-            while j < len(blocks):
-                block = blocks[j]
-
-                if block.get("block_label") != "text":
-                    break
-
-                text = normalize_text(
-                    block.get("block_content", "")
-                )
-
-                bbox = block.get("block_bbox")
-
-                if (
-                    not text
-                    or not isinstance(
-                        bbox,
-                        (list, tuple),
-                    )
-                    or len(bbox) != 4
-                ):
-                    break
-
-                run.append(
-                    (
-                        j,
-                        text,
-                        bbox,
-                    )
-                )
-
+                anchors.append((j, cur, ma.group(2)))
+                pending = []
                 j += 1
-
-            if len(run) < 4:
                 continue
 
-            for cut in range(3, len(run)):
-                region = run[:cut]
-                after = run[cut]
+            # Unmarked text is only provisional continuation material.
+            # It becomes usable only if another matching bullet anchor
+            # subsequently confirms the list.
+            if continuation_compatible(anchors[-1][1], cur):
+                pending.append((j, cur, text))
+                j += 1
+                continue
 
-                xs = [
-                    float(item[2][0])
-                    for item in region
-                ]
+            break
 
-                x_range = max(xs) - min(xs)
+        if len(anchors) >= 2:
+            # Reconstruct each confirmed item independently.
+            for pos, (idx, anchor_block, body) in enumerate(anchors):
+                parts = [body]
 
-                if x_range > 5.0:
-                    continue
+                if pos + 1 < len(anchors):
+                    next_idx = anchors[pos + 1][0]
 
-                region_lengths = [
-                    len(item[1])
-                    for item in region
-                ]
+                    for k in range(idx + 1, next_idx):
+                        cb = blocks[k]
 
-                item_sized_count = sum(
-                    length >= 70
-                    for length in region_lengths
-                )
+                        if cb.get("block_label") != "text":
+                            break
 
-                if item_sized_count < 3:
-                    continue
+                        ct = block_text(cb)
 
-                region_x = sum(xs) / len(xs)
-                after_x = float(after[2][0])
-                after_len = len(after[1])
+                        if not ct:
+                            continue
 
-                layout_break = (
-                    abs(after_x - region_x) >= 20.0
-                    and
-                    after_len
-                    >= 2 * max(region_lengths)
-                )
+                        # Never absorb another explicit marker.
+                        if any_anchor_re.match(ct) or numbered_re.match(ct):
+                            break
 
-                if not layout_break:
-                    continue
+                        if continuation_compatible(anchor_block, cb):
+                            parts.append(ct)
+                        else:
+                            break
 
-                merged = normalize_text(
-                    " ".join(
-                        item[1]
-                        for item in region
-                    )
-                )
+                item = finalise(" ".join(parts))
 
-                if merged:
-                    results.append(
-                        (
-                            pdf.pdf_name,
-                            page_index,
-                            "list",
-                            merged,
-                        )
-                    )
+                if item:
+                    out.append(item)
 
-                break
+            i = anchors[-1][0] + 1
+        else:
+            i += 1
 
-    if not results:
-        return False, []
-
+    # Preserve order while avoiding duplicate predictions generated by
+    # overlapping OCR representations.
     deduped = []
     seen = set()
 
-    for item in results:
-        key = (
-            item[0],
-            item[2],
-            item[3],
-        )
-
-        if key in seen:
+    for item in out:
+        if not item or item in seen:
             continue
-
-        seen.add(key)
+        seen.add(item)
         deduped.append(item)
 
-    return True, deduped
+    return deduped
 
-
-
-
-def extract_footer(pdf):
-
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    footer_labels = {
-        "footnote",
-        "vision_footnote",
-        "footer",
-    }
-
-    footers = []
-    seen = set()
-
-    for page in pages:
-
-        page_index = page["page_index"]
-
-        for block in page.get("parsing_res_list", []):
-
-            if block.get("block_label") not in footer_labels:
-                continue
-
-            text = normalize_string(block.get("block_content", ""))
-
-            if not text:
-                continue
-
-            if text in seen:
-                continue
-
-            seen.add(text)
-
-            footers.append(
-                (
-                    pdf.pdf_name,
-                    page_index,
-                    "footer",
-                    text
-                )
-            )
-
-    if not footers:
-        return False, []
-
-    return True, footers
-
-def extract_header(pdf):
-
-    pages = load_all_pages(pdf)
-
-    if not pages:
-        return False, []
-
-    headers = []
-
-    for page in pages:
-        page_index = page.get("page_index", "?")
-
-        blocks = page.get("parsing_res_list", [])
-
-        page_headers = []
-
-        for block in blocks:
-
-            label = block.get("block_label")
-
-            text = normalize_string(block.get("block_content", ""))
-
-            if label != "header":
-                continue
-
-            if not text:
-                continue
-
-            skip_patterns = [
-                "journal of l",
-                "aps/123-qed",
-                "chapter ",
-                "appendix ",
-                "references",
-                "figures & tables",
-                "the following material supplements the paper",
-                "professorship program.",
-            ]
-
-            lower_text = text.lower()
-
-            if any(p in lower_text for p in skip_patterns):
-                continue
-
-            page_headers.append(text)
-
-        if page_headers:
-            merged = " ".join(" ".join(page_headers).split())
-
-            headers.append(
-                (
-                    pdf.pdf_name,
-                    page_index,
-                    "header",
-                    merged,
-                )
-            )
-
-    if not headers:
-        return False, []
-
-    return True, headers
 
 def extract_raw(base_dir, label, pdf):
+    import os
+    from pathlib import Path
+
     handlers = {
         "title": extract_title,
         "caption": extract_caption,
@@ -4433,4 +2229,52 @@ def extract_raw(base_dir, label, pdf):
     if label not in handlers:
         return False, []
 
-    return handlers[label](pdf)
+    raw_root = os.environ.get("PADDLEOCR_RAW_ROOT")
+    if not raw_root:
+        raise RuntimeError(
+            "PADDLEOCR_RAW_ROOT is not defined. "
+            "It must point to the PaddleOCR raw-output directory."
+        )
+
+    pdf_name = pdf.pdf_name
+    stem = Path(pdf_name).stem
+    raw_dir = Path(raw_root) / stem
+
+    if not raw_dir.is_dir():
+        raise FileNotFoundError(
+            f"Raw PaddleOCR directory not found for {pdf_name}: {raw_dir}"
+        )
+
+    def page_number(path):
+        name = path.stem
+        prefix = f"{stem}_"
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+        if name.endswith("_res"):
+            name = name[:-4]
+        return int(name)
+
+    raw_paths = sorted(
+        raw_dir.glob("*_res.json"),
+        key=page_number,
+    )
+
+    rows = []
+    handler = handlers[label]
+
+    for raw_path in raw_paths:
+        page = page_number(raw_path)
+
+        values = handler(raw_path)
+
+        for value in values:
+            rows.append(
+                (
+                    pdf_name,
+                    page,
+                    label,
+                    value,
+                )
+            )
+
+    return True, rows
