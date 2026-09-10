@@ -3,6 +3,7 @@ import re
 import unicodedata
 from pylatexenc.latex2text import LatexNodes2Text
 from pathlib import Path
+from ...normalisation import normalize_string
 
 
 DEFAULT_RAW_PAGES_DIR = (
@@ -4891,4 +4892,11 @@ def extract_raw(base_dir, label, pdf):
     if label not in handlers:
         return False, []
 
-    return handlers[label](pdf)
+    supported, results = handlers[label](pdf)
+
+    normalized_results = [
+        (pdf_name, page, result_label, normalize_string(text))
+        for pdf_name, page, result_label, text in results
+    ]
+
+    return supported, normalized_results
