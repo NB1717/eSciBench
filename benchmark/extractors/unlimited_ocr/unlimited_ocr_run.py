@@ -1080,40 +1080,68 @@ def extract_email(pdf):
     """
     Extract email addresses from every block on every page.
 
-    Only the email substring is returned, independently of the raw
-    block label or surrounding affiliation/correspondence text.
+    Supports ordinary email addresses, OCR whitespace around '@' and
+    domain dots, and grouped author-email notation commonly used in
+    scientific papers, such as {alice,bob}@example.edu.
     """
     email_pattern = re.compile(
         r"(?<![A-Za-z0-9._%+\-])"
         r"[A-Za-z0-9._%+\-]+"
-        r"@[A-Za-z0-9.\-]+"
+        r"@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)*"
         r"\.[A-Za-z]{2,}"
         r"(?![A-Za-z0-9.\-])",
+        flags=re.IGNORECASE,
+    )
+
+    grouped_email_pattern = re.compile(
+        r"[\{\[]\s*"
+        r"(?P<locals>[A-Za-z0-9._%+\-]+"
+        r"(?:\s*[,;]\s*[A-Za-z0-9._%+\-]+)+)"
+        r"\s*[\}\]]\s*@\s*"
+        r"(?P<domain>[A-Za-z0-9\-]+"
+        r"(?:\s*\.\s*[A-Za-z0-9\-]+)*"
+        r"\s*\.\s*[A-Za-z]{2,})",
         flags=re.IGNORECASE,
     )
 
     results = []
     seen = set()
 
+    def add_email(value):
+        email = value.lower()
+
+        if email in seen:
+            return
+
+        seen.add(email)
+        results.append(
+            (
+                pdf.pdf_name,
+                0,
+                "email",
+                email,
+            )
+        )
+
     for page in _load_pdf_blocks(pdf):
         for block in page["blocks"]:
-            for match in email_pattern.finditer(
-                block["content"]
-            ):
-                email = match.group(0).lower()
+            content = str(block["content"])
 
-                if email in seen:
-                    continue
+            for match in grouped_email_pattern.finditer(content):
+                domain = re.sub(r"\s+", "", match.group("domain"))
+                for local in re.split(r"\s*[,;]\s*", match.group("locals")):
+                    if local:
+                        add_email(f"{local}@{domain}")
 
-                seen.add(email)
-                results.append(
-                    (
-                        pdf.pdf_name,
-                        0,
-                        "email",
-                        email,
-                    )
-                )
+            normalized_content = re.sub(r"\s*@\s*", "@", content)
+            normalized_content = re.sub(
+                r"(?<=[A-Za-z0-9])\s*\.\s*(?=[A-Za-z0-9])",
+                ".",
+                normalized_content,
+            )
+
+            for match in email_pattern.finditer(normalized_content):
+                add_email(match.group(0))
 
     return True, results
 
