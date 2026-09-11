@@ -34,6 +34,7 @@ from tqdm import tqdm
 # IMPORT EXTRACTORS
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from benchmark.extractors.grobid.grobid_run import extract_raw as extract_raw_grobid, extraction_if_needed as extraction_grobid_if_needed
+from benchmark.extractors.grobid.grobid_v090_run import extract_raw as extract_raw_grobid_v090, extraction_if_needed as extraction_grobid_v090_if_needed
 from benchmark.extractors.refextract.refextract_run import extract_raw as extract_raw_refextract
 from benchmark.extractors.pymupdf.pymupdf_run import extract_raw as extract_raw_pymupdf
 from benchmark.extractors.tabula.tabula_run import extract_raw as extract_raw_tabula
@@ -65,6 +66,7 @@ extractor_map:dict[str, callable] = {
     "cermine": extract_raw_cermine,
     "docling": extract_raw_docling,
     "grobid": extract_raw_grobid,
+    "grobid_v090": extract_raw_grobid_v090,
     "nougat": extract_raw_nougat,
     "pdfact": extract_raw_pdfact,
     "pdfplumber": extract_raw_pdfplumber,
@@ -161,6 +163,8 @@ def run_benchmark(base_dir, labels, tools):
         # 1. Tools needing to generate an extraction file
         if tool == 'grobid': 
             extraction_grobid_if_needed(base_dir)
+        elif tool == 'grobid_v090':
+            extraction_grobid_v090_if_needed(base_dir)
         elif tool == 'cermine':
             run_cermine_if_needed(base_dir)
         if tool == "docling": 
