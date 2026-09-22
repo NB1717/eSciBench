@@ -4,7 +4,7 @@ Clean OLMOCR wrapper for eSciBench.
 Built from scratch.
 No previous OLMOCR wrapper logic is used here.
 
-Final evaluation copy locked to the fixed Test96 dataset.
+Development copy locked to the fixed Noah Dev5 dataset.
 
 Expected extractor interface:
     extract_raw(base_dir, label, pdf)
@@ -26,14 +26,14 @@ from benchmark.normalisation import normalize_string
 # Development paths
 # ---------------------------------------------------------------------------
 
-PROJECT_ROOT = Path("/scratch/nasimb/escibench_project/OlmOcr_orginal")
+PROJECT_ROOT = Path("/scratch/nasimb/escibench_project/NOAH_DATA/OlmOcr_NoahNasim")
 
-TEST96_DATA_DIR = (PROJECT_ROOT / "test96_escibench").resolve()
+TEST96_DATA_DIR = (PROJECT_ROOT / "Test96_benchmark_input").resolve()
 
 TEST96_RAW_JSONL = (
     PROJECT_ROOT
-    / "raw_test96_escibench"
-    / "results"
+    / "Test96_raw_OlmOcr"
+    / "jsonl"
     / "olmocr_test96.jsonl"
 ).resolve()
 
@@ -118,14 +118,14 @@ def _get_olmocr_record(base_dir, pdf):
     """
     Return the OLMOCR raw record corresponding to one eSciBench PDF.
 
-    Final-evaluation safety guard:
-    only the fixed Test96 dataset is accepted here.
+    Development safety guard:
+    only the fixed Noah Dev5 dataset is accepted here.
     """
     resolved_base_dir = Path(base_dir).resolve()
 
     if resolved_base_dir != TEST96_DATA_DIR:
         raise RuntimeError(
-            "Final evaluation wrapper is locked to the fixed Test96 dataset. "
+            "Development wrapper is locked to the fixed Noah Dev5 dataset. "
             f"Received base_dir: {resolved_base_dir}"
         )
 
@@ -3418,7 +3418,7 @@ def extract_raw(base_dir, label, pdf):
     """
     eSciBench extractor interface for the clean OLMOCR wrapper.
 
-    Final evaluation remains locked to the fixed Test96 dataset.
+    Development remains locked to the fixed Noah Dev5 dataset.
     """
     record = _get_olmocr_record(base_dir, pdf)
 
