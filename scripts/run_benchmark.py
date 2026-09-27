@@ -47,6 +47,7 @@ from benchmark.extractors.pdfplumber.pdfplumber_run import extract_pdfplumber as
 
 from benchmark.extractors.nougat.nougat_run import extract_raw as extract_raw_nougat, extraction_if_needed as extraction_if_needed_nougat
 from benchmark.extractors.docling.docling_run import extract_raw as extract_raw_docling, extraction_if_needed as extraction_if_needed_docling
+from benchmark.extractors.unlimited_ocr.unlimited_ocr_run import extract_raw as extract_raw_unlimited_ocr
 
 # IMPORT DATASET UTILS
 from benchmark.dataset.extract_gt import extract_ground_truth_json
@@ -66,6 +67,7 @@ extractor_map:dict[str, callable] = {
     "docling": extract_raw_docling,
     "grobid": extract_raw_grobid,
     "nougat": extract_raw_nougat,
+    "unlimited_ocr": extract_raw_unlimited_ocr,
     "pdfact": extract_raw_pdfact,
     "pdfplumber": extract_raw_pdfplumber,
     "pymupdf": extract_raw_pymupdf,
