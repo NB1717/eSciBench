@@ -47,7 +47,7 @@ from benchmark.extractors.pdfplumber.pdfplumber_run import extract_pdfplumber as
 
 from benchmark.extractors.nougat.nougat_run import extract_raw as extract_raw_nougat, extraction_if_needed as extraction_if_needed_nougat
 from benchmark.extractors.docling.docling_run import extract_raw as extract_raw_docling, extraction_if_needed as extraction_if_needed_docling
-
+from benchmark.extractors.marker.marker_run import extract_raw as extract_raw_marker
 # IMPORT DATASET UTILS
 from benchmark.dataset.extract_gt import extract_ground_truth_json
 from benchmark.evaluation.metrics import compute_metrics
@@ -74,6 +74,7 @@ extractor_map:dict[str, callable] = {
     "scienceparse": extract_raw_scienceparse,
     "tabula": extract_raw_tabula,
     "unstructured": extract_raw_unstructured,
+    "marker": extract_raw_marker,
 }
 """
 Dictionnary mapping the extractors (keys) to their coresponding processing 
